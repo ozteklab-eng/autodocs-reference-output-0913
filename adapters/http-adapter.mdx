@@ -1,0 +1,143 @@
+---
+title: "AbstractHttpAdapter: NestJS HTTP Adapter Contract"
+sidebarTitle: "HTTP Adapter"
+description: "The AbstractHttpAdapter class defines the contract between NestJS core and any underlying HTTP server library, covering verbs, response helpers, server management, and versioning."
+---
+
+`AbstractHttpAdapter` is the bridge between NestJS core and the actual HTTP server library you choose. Every route registration, middleware mount, response render, and error handler passes through this class. At commit `a3a31b9`, the contract lives in `packages/core/adapters/http-adapter.ts` and is implemented by `ExpressAdapter` and `FastifyAdapter`.
+
+## Core fields
+
+The adapter stores two protected fields that every implementation must manage:
+
+```ts packages/core/adapters/http-adapter.ts
+export abstract class AbstractHttpAdapter<
+  TServer = any,
+  TRequest = any,
+  TResponse = any,
+> implements HttpServer<TRequest, TResponse> {
+  protected httpServer: TServer;
+
+  constructor(protected instance?: any) {}
+```
+
+- `instance` holds the native framework application object (an Express app or a Fastify instance).
+- `httpServer` holds the underlying Node.js `http.Server` or `https.Server` created during initialization.
+
+## HTTP verb handlers
+
+The adapter exposes a method for every HTTP verb Nest supports. Each method has two overloads: one that accepts only a handler, and one that accepts a path plus a handler. The default implementation forwards the call to `this.instance[verb](...args)`.
+
+```ts packages/core/adapters/http-adapter.ts
+  public get(handler: RequestHandler);
+  public get(path: any, handler: RequestHandler);
+  public get(...args: any[]) {
+    return this.instance.get(...args);
+  }
+```
+
+The same pattern repeats for `post`, `put`, `delete`, `patch`, `head`, `options`, `all`, `search`, `propfind`, `proppatch`, `mkcol`, `copy`, `move`, `lock`, and `unlock`.
+
+## Request and response helpers
+
+Several methods abstract how Nest reads from requests and writes to responses. These are declared abstract so each platform can implement them with the native API:
+
+```ts packages/core/adapters/http-adapter.ts
+  abstract status(response: any, statusCode: number);
+  abstract reply(response: any, body: any, statusCode?: number);
+  abstract end(response: any, message?: string);
+  abstract render(response: any, view: string, options: any);
+  abstract redirect(response: any, statusCode: number, url: string);
+  abstract setHeader(response: any, name: string, value: string);
+  abstract appendHeader(response: any, name: string, value: string);
+  abstract getHeader(response: any, name: string);
+  abstract isHeadersSent(response: any);
+```
+
+Request introspection methods let Nest extract metadata without depending on framework-specific properties:
+
+```ts packages/core/adapters/http-adapter.ts
+  abstract getRequestHostname(request: any);
+  abstract getRequestMethod(request: any);
+  abstract getRequestUrl(request: any);
+```
+
+## Server management
+
+The adapter is responsible for creating and exposing the native server instance:
+
+```ts packages/core/adapters/http-adapter.ts
+  abstract initHttpServer(options: NestApplicationOptions);
+  abstract close();
+
+  public getHttpServer(): TServer {
+    return this.httpServer;
+  }
+
+  public getInstance<T = any>(): T {
+    return this.instance as T;
+  }
+```
+
+`initHttpServer` is called during application bootstrap. `ExpressAdapter` uses it to create an `http.Server` or `https.Server`, while `FastifyAdapter` simply captures the server that Fastify already created internally.
+
+## Extension surface
+
+The contract also defines hooks for features that platforms may support differently:
+
+```ts packages/core/adapters/http-adapter.ts
+  abstract useStaticAssets(...args: any[]);
+  abstract setViewEngine(engine: string);
+  abstract enableCors(options?: any, prefix?: string);
+  abstract registerParserMiddleware(prefix?: string, rawBody?: boolean);
+  abstract createMiddlewareFactory(
+    requestMethod: RequestMethod,
+  ):
+    | ((path: string, callback: Function) => any)
+    | Promise<(path: string, callback: Function) => any>;
+  abstract applyVersionFilter(
+    handler: Function,
+    version: VersionValue,
+    versioningOptions: VersioningOptions,
+  ): (req: TRequest, res: TResponse, next: () => void) => Function;
+```
+
+- `useStaticAssets` and `setViewEngine` power the static-file and template rendering features.
+- `registerParserMiddleware` installs body parsing middleware.
+- `createMiddlewareFactory` returns a function that Nest uses when `MiddlewareConsumer.apply(...).forRoutes(...)` is called.
+- `applyVersionFilter` is the versioning gate: it wraps a route handler so that requests with non-matching versions are skipped.
+
+## Adapter capability signals
+
+One boolean method tells Nest how the underlying router behaves:
+
+```ts packages/core/adapters/http-adapter.ts
+  abstract getType(): string;
+```
+
+There is also a concrete method, `isRouteOrderSensitive()`, that is overridden by each platform. `ExpressAdapter.isRouteOrderSensitive()` returns `true` because Express matches routes in declaration order. `FastifyAdapter.isRouteOrderSensitive()` returns `false` because Fastify uses a radix tree. This signal drives `NestApplication.registerRouter` in `packages/core/nest-application.ts` (around line 219), where Nest decides whether to sort routes by specificity and whether duplicate route detection must happen before registration.
+
+## Accessing the adapter at runtime
+
+Providers can inject `HttpAdapterHost` to reach the active adapter:
+
+```ts packages/core/helpers/http-adapter-host.ts
+export class HttpAdapterHost<
+  T extends AbstractHttpAdapter = AbstractHttpAdapter,
+> {
+  set httpAdapter(httpAdapter: T) {
+    this._httpAdapter = httpAdapter;
+    this._init$.next();
+    this._init$.complete();
+  }
+
+  get httpAdapter(): T {
+    return this._httpAdapter as T;
+  }
+```
+
+`BaseExceptionFilter` uses this service to call `httpAdapter.reply` and `httpAdapter.status` when handling errors, which keeps the filter itself platform-agnostic.
+
+## Why the contract matters
+
+Because every HTTP interaction flows through `AbstractHttpAdapter`, Nest core never imports Express or Fastify directly. You can swap the adapter by passing a different instance to `NestFactory.create`, and the rest of the framework continues to work unchanged. The contract is the boundary that makes Nest platform-agnostic.

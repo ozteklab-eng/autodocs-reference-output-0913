@@ -1,0 +1,184 @@
+---
+title: "Modules and the NestJS DI Container"
+sidebarTitle: "Modules & Container"
+description: "How NestJS modules are compiled into tokens, stored in NestContainer, and wired together through imports, exports, global modules, and forward references at commit a3a31b9."
+---
+
+The NestJS dependency-injection graph is built from `@Module` metadata into an in-memory container before any provider is instantiated. This page explains how the `Module` decorator records metadata, how `NestContainer` stores modules, how module tokens are generated, and how global modules, dynamic modules, and forward references affect the graph.
+
+## `@Module` metadata recording
+
+The `@Module` decorator in `packages/common/decorators/modules/module.decorator.ts` takes a `ModuleMetadata` object and writes each key as metadata on the target class using `Reflect.defineMetadata`:
+
+```ts packages/common/decorators/modules/module.decorator.ts
+export function Module(metadata: ModuleMetadata): ClassDecorator {
+  const propsKeys = Object.keys(metadata);
+  validateModuleKeys(propsKeys);
+
+  return (target: Function) => {
+    for (const property in metadata) {
+      if (Object.hasOwn(metadata, property)) {
+        Reflect.defineMetadata(property, (metadata as any)[property], target);
+      }
+    }
+  };
+}
+```
+
+At this stage no classes are instantiated. The metadata keys are `imports`, `controllers`, `providers`, and `exports`, plus `global` when used with `@Global()`.
+
+## `NestContainer` structure
+
+`NestContainer` in `packages/core/injector/container.ts` owns the runtime module graph. Its key fields are:
+
+- `modules: ModulesContainer` — a `Map<string, Module>` keyed by module token.
+- `globalModules: Set<Module>` — modules marked global so they can be auto-imported everywhere.
+- `dynamicModulesMetadata: Map<string, Partial<DynamicModule>>` — extra metadata for dynamic modules.
+- `internalCoreModule: Module` — the framework-internal core module that hosts `REQUEST` and other internal providers.
+- `_serializedGraph: SerializedGraph` — populated when `snapshot: true` is enabled.
+- `moduleCompiler: ModuleCompiler` — turns module classes or dynamic definitions into tokens.
+
+The container also holds `internalProvidersStorage`, which stores the `HttpAdapter` and `HttpAdapterHost` references.
+
+## Module token generation
+
+`ModuleCompiler.compile` in `packages/core/injector/compiler.ts` extracts a `type` and optional `dynamicMetadata`, then delegates token creation to a `ModuleOpaqueKeyFactory`:
+
+```ts packages/core/injector/compiler.ts
+public async compile(
+  moduleClsOrDynamic:
+    | Type
+    | DynamicModule
+    | ForwardReference
+    | Promise<DynamicModule>,
+): Promise<ModuleFactory> {
+  moduleClsOrDynamic = await moduleClsOrDynamic;
+
+  const { type, dynamicMetadata } = this.extractMetadata(moduleClsOrDynamic);
+  const token = dynamicMetadata
+    ? this._moduleOpaqueKeyFactory.createForDynamic(
+        type,
+        dynamicMetadata,
+        moduleClsOrDynamic as DynamicModule | ForwardReference,
+      )
+    : this._moduleOpaqueKeyFactory.createForStatic(
+        type,
+        moduleClsOrDynamic as Type,
+      );
+
+  return { type, dynamicMetadata, token };
+}
+```
+
+`extractMetadata` unwraps `forwardRef(() => X)` and separates `DynamicModule` into `{ module: type, ...dynamicMetadata }`.
+
+### `ByReferenceModuleOpaqueKeyFactory` (default)
+
+At commit `a3a31b9`, the default factory is `ByReferenceModuleOpaqueKeyFactory` in `packages/core/injector/opaque-key-factory/by-reference-module-opaque-key-factory.ts`. It caches a token on the original reference object using a `K_MODULE_ID` symbol, so the same object always yields the same token:
+
+```ts packages/core/injector/opaque-key-factory/by-reference-module-opaque-key-factory.ts
+private getOrCreateModuleId(
+  moduleCls: Type<unknown>,
+  dynamicMetadata: Partial<DynamicModule> | undefined,
+  originalRef: Type | DynamicModule | ForwardReference,
+): string {
+  if (originalRef[K_MODULE_ID]) {
+    return originalRef[K_MODULE_ID];
+  }
+
+  let moduleId: string;
+  if (this.keyGenerationStrategy === 'random') {
+    moduleId = this.generateRandomString();
+  } else {
+    const delimiter = ':';
+    moduleId = dynamicMetadata
+      ? `${this.generateRandomString()}${delimiter}${this.hashString(moduleCls.name + JSON.stringify(dynamicMetadata))}`
+      : `${this.generateRandomString()}${delimiter}${this.hashString(moduleCls.toString())}`;
+  }
+
+  originalRef[K_MODULE_ID] = moduleId;
+  return moduleId;
+}
+```
+
+When `snapshot: true` is set, the strategy switches to `shallow`, producing deterministic hashes.
+
+### `DeepHashedModuleOpaqueKeyFactory`
+
+If you set `moduleIdGeneratorAlgorithm: 'deep-hash'`, NestJS uses `DeepHashedModuleOpaqueKeyFactory` in `packages/core/injector/opaque-key-factory/deep-hashed-module-opaque-key-factory.ts`. It serializes the entire dynamic metadata object (including nested functions and classes) with `fast-safe-stringify`, hashes the result with SHA-256, and caches the result in a `Map`. Because deep serialization can be slow for large objects, the factory logs a warning when it exceeds 10 ms.
+
+## `Module` class internals
+
+Each registered module becomes a `Module` instance in `packages/core/injector/module.ts`. It holds:
+
+- `_imports: Set<Module>` — directly imported modules.
+- `_providers: Map<InjectionToken, InstanceWrapper<Injectable>>` — providers including the module class itself, `ModuleRef`, and `ApplicationConfig`.
+- `_injectables: Map<InjectionToken, InstanceWrapper<Injectable>>` — enhancers such as guards, pipes, interceptors, and filters.
+- `_middlewares: Map<InjectionToken, InstanceWrapper<Injectable>>` — middleware classes.
+- `_controllers: Map<InjectionToken, InstanceWrapper<Controller>>` — controllers.
+- `_exports: Set<InjectionToken>` — tokens exported to importers.
+- `_distance: number` — used during middleware registration to sort global modules first.
+- `_isGlobal: boolean` — set when the module is global.
+
+The constructor calls `addCoreProviders()`, which registers:
+
+1. The module class as a provider (so the module can inject itself).
+2. A per-module `ModuleRef` subclass.
+3. The shared `ApplicationConfig` instance.
+
+## Adding components to a module
+
+`NestContainer` exposes methods that delegate to the corresponding `Module` methods:
+
+- `addProvider(provider, token, enhancerSubtype?)` — calls `moduleRef.addProvider`.
+- `addInjectable(injectable, token, enhancerSubtype, host?)` — calls `moduleRef.addInjectable`.
+- `addController(controller, token)` — calls `moduleRef.addController`.
+- `addExportedProviderOrModule(toExport, token)` — calls `moduleRef.addExportedProviderOrModule`.
+- `addImport(relatedModule, token)` — calls `moduleRef.addImport` after compiling the related module's token.
+
+`addProvider` also invokes `DiscoverableMetaHostCollection.inspectProvider` so the discovery service can later find providers by decorator metadata.
+
+## Global modules
+
+A module is global if either `@Global()` decorates it or the `DynamicModule` sets `global: true`. `NestContainer.isGlobalModule` checks both conditions:
+
+```ts packages/core/injector/container.ts
+public isGlobalModule(
+  metatype: Type<any>,
+  dynamicMetadata?: Partial<DynamicModule>,
+): boolean {
+  if (dynamicMetadata && dynamicMetadata.global) {
+    return true;
+  }
+  return !!Reflect.getMetadata(GLOBAL_MODULE_METADATA, metatype);
+}
+```
+
+Global modules are added to `globalModules` and their distance is set to `Number.MAX_VALUE`. During `bindGlobalScope()`, every module receives every global module as an import via `bindGlobalsToImports`.
+
+## Dynamic modules
+
+A `DynamicModule` is an object `{ module: Type, imports?, controllers?, providers?, exports? }`. When `addModule` receives a dynamic module, `ModuleCompiler` extracts `dynamicMetadata`, stores it in `dynamicModulesMetadata`, and then `addDynamicModules` recursively registers the dynamic imports. This lets libraries expose `forRoot` / `forFeature` factories that return fully configured modules.
+
+## Forward references
+
+`forwardRef(() => X)` is unwrapped in `ModuleCompiler.extractMetadata`:
+
+```ts packages/core/injector/compiler.ts
+return {
+  type: (moduleClsOrDynamic as ForwardReference)?.forwardRef
+    ? (moduleClsOrDynamic as ForwardReference).forwardRef()
+    : moduleClsOrDynamic,
+  dynamicMetadata: undefined,
+};
+```
+
+The container also guards against `forwardRef(() => undefined)` by throwing `UndefinedForwardRefException` in `addModule` and `replaceModule`.
+
+## Provider overrides and `replace`
+
+`NestContainer.replace(toReplace, options)` iterates every module and calls `moduleRef.replace`. This is used by the testing module to swap providers, guards, pipes, interceptors, or filters. `Module.replace` merges the override into the existing `InstanceWrapper` via `mergeWith`.
+
+## Internal providers storage
+
+`InternalProvidersStorage` in `packages/core/injector/internal-providers-storage.ts` holds the `HttpAdapter` and `HttpAdapterHost` instances. The container exposes `setHttpAdapter`, `getHttpAdapterRef`, and `getHttpAdapterHostRef` so that the adapter can be shared across the framework without being a normal provider.

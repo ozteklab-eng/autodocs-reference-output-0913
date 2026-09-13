@@ -1,0 +1,132 @@
+---
+title: "NestJS WebSockets: SocketModule, Gateways, and Adapters"
+sidebarTitle: "WebSockets"
+description: "How SocketModule discovers gateways, wires WebSocketsController, and delegates to platform adapters like IoAdapter and WsAdapter for real-time transport."
+---
+
+NestJS exposes real-time protocols through a dedicated `SocketModule` that scans the DI container for classes decorated with `@WebSocketGateway`, connects them to a platform-specific adapter, and routes incoming messages through the same enhancer pipeline as HTTP handlers. This page explains that module, the gateway decorators, and the two platform adapters shipped in the monorepo.
+
+## SocketModule: gateway discovery and wiring
+
+`SocketModule` in `packages/websockets/socket-module.ts` is loaded lazily by `NestApplication.init()` when the `@nestjs/websockets` package is present. Its `register` method takes the `NestContainer`, the `ApplicationConfig`, the `GraphInspector`, plus the app options and (optionally) the underlying HTTP server:
+
+```ts packages/websockets/socket-module.ts
+export class SocketModule<HttpServer = any> {
+  public register(
+    container: NestContainer,
+    applicationConfig: ApplicationConfig,
+    graphInspector: GraphInspector,
+    appOptions: NestApplicationContextOptions = {},
+    httpServer?: HttpServer,
+  ) {
+    // ...iterate modules and providers, filter gateways...
+  }
+}
+```
+
+For every provider in every module whose metatype carries the `IS_GATEWAY_METADATA` flag (set by `@WebSocketGateway`), the module builds a `WebSocketsController` binding, resolves the adapter, and hooks the underlying server instance into any property annotated with `@WebSocketServer()`. On `close()`, `SocketModule` walks its internal `SocketsContainer` and calls `close()` on every created server.
+
+## WebSocketsController: bridging gateways and adapters
+
+`WebSocketsController` in `packages/websockets/web-sockets-controller.ts` is the bridge between a gateway class and the transport adapter. For each gateway it:
+
+1. Reads gateway options and port from the class metadata.
+2. Resolves the current adapter via `applicationConfig.getIoAdapter()`.
+3. Calls `adapter.create(port, options)` to obtain the underlying server.
+4. Subscribes connection, disconnect, and message events by pattern.
+
+The controller connects each `@SubscribeMessage(message)` handler through the enhancer pipeline (guards, interceptors, pipes, and filters), so gateway methods enjoy the same runtime semantics as HTTP handlers. The only differences are the arguments host produced by `ExecutionContextHost.switchToWs()` and the exception path, which flows through `WsExceptionsHandler`.
+
+## Gateway decorators
+
+All gateway decorators live under `packages/websockets/decorators/`.
+
+### `@WebSocketGateway`
+
+`WebSocketGateway(portOrOptions?, options?)` in `socket-gateway.decorator.ts` marks a class as a gateway. It applies three metadata keys to the class:
+
+- `IS_GATEWAY_METADATA` set to `true`, used by `SocketModule` to filter providers.
+- `PORT_METADATA` holding the port (or `0` to reuse the HTTP server).
+- `GATEWAY_OPTIONS` holding transport-specific options (namespace, path, CORS, etc.).
+
+```ts packages/websockets/decorators/socket-gateway.decorator.ts
+export function WebSocketGateway(
+  portOrOptions?: number | GatewayMetadata,
+  options?: GatewayMetadata,
+): ClassDecorator;
+```
+
+### `@WebSocketServer`
+
+`WebSocketServer()` in `gateway-server.decorator.ts` marks a class property that will receive the underlying server instance once the gateway is created. `SocketModule.hookServersToProperties` reads a `GATEWAY_SERVER_METADATA` entry from the prototype and assigns each matched property.
+
+### `@SubscribeMessage`
+
+`SubscribeMessage(message)` in `subscribe-message.decorator.ts` marks a method as a handler for a given message pattern. It sets `MESSAGE_METADATA` on the method, which `WebSocketsController` reads when it subscribes the handler.
+
+## NestGateway interface
+
+`NestGateway` in `packages/websockets/interfaces/nest-gateway.interface.ts` describes the optional lifecycle hooks a gateway can implement:
+
+```ts packages/websockets/interfaces/nest-gateway.interface.ts
+export interface NestGateway {
+  afterInit?(server: any): void;
+  handleConnection?(client: any, ...args: any[]): void;
+  handleDisconnect?(client: any): void;
+}
+```
+
+`WebSocketsController` invokes each hook at the corresponding point in the socket lifecycle. Gateways are otherwise ordinary providers and participate fully in DI.
+
+## Adapters
+
+Adapter code lives under `packages/websockets/adapters/` and each shipped platform adapter under its own package.
+
+### `AbstractWsAdapter`
+
+`AbstractWsAdapter` in `packages/websockets/adapters/ws-adapter.ts` defines the contract every adapter must implement:
+
+- `create(port, options?)` returns a server instance.
+- `bindClientConnect(server, callback)` and `bindClientDisconnect(client, callback)` wire connection lifecycle events.
+- `bindMessageHandlers(client, handlers, transform)` subscribes message patterns.
+- `close(server)` shuts the server down.
+
+The base class also normalizes RxJS-style message-handler responses into a stream the concrete adapter can send.
+
+### `IoAdapter` (Socket.IO)
+
+`IoAdapter` in `packages/platform-socket.io/adapters/io-adapter.ts` extends `AbstractWsAdapter` for Socket.IO. It constructs a `Server` from the `socket.io` package, attaches it to the HTTP server when the gateway port is `0`, and exposes namespaces via `server.of(namespace)`.
+
+### `WsAdapter` (ws)
+
+`WsAdapter` in `packages/platform-ws/adapters/ws-adapter.ts` extends the same base for the lightweight `ws` package. It wraps `WebSocket.Server`, converts incoming raw messages to the shape the enhancer pipeline expects, and forwards responses via `client.send`.
+
+### Wiring a custom adapter
+
+User code selects an adapter through `NestApplication.useWebSocketAdapter(adapter)`, which stores it on the shared `ApplicationConfig` via `setIoAdapter`. `WebSocketsController` reads that value for every gateway it creates.
+
+```ts packages/core/nest-application.ts
+public useWebSocketAdapter(adapter: WebSocketAdapter): this {
+  this.config.setIoAdapter(adapter);
+  return this;
+}
+```
+
+## Message dispatch
+
+When a client sends a message, the adapter converts it to `(client, data, pattern)` arguments and passes it to the resolved handler. The generated wrapper builds an `ExecutionContextHost` and calls `switchToWs()`, which yields `{ getClient, getData, getPattern }`. Guards, interceptors, and pipes run exactly as in HTTP: see [Execution Context](/http/execution-context) and [Enhancers](/http/enhancers).
+
+If a handler throws, `WsExceptionsHandler` runs the registered filter chain; unknown errors are wrapped as generic errors and forwarded to the client. For deeper coverage of exception handling see [Exception Filters](/http/exception-filters).
+
+## Source references
+
+- `packages/websockets/socket-module.ts` — `SocketModule.register`, `hookServersToProperties`, `close`
+- `packages/websockets/web-sockets-controller.ts` — gateway to adapter binding, `subscribeMessages`, `subscribeConnectionEvent`, `subscribeDisconnectEvent`
+- `packages/websockets/decorators/socket-gateway.decorator.ts` — `@WebSocketGateway`, `IS_GATEWAY_METADATA`, `PORT_METADATA`, `GATEWAY_OPTIONS`
+- `packages/websockets/decorators/gateway-server.decorator.ts` — `@WebSocketServer`, `GATEWAY_SERVER_METADATA`
+- `packages/websockets/decorators/subscribe-message.decorator.ts` — `@SubscribeMessage`, `MESSAGE_METADATA`
+- `packages/websockets/interfaces/nest-gateway.interface.ts` — `NestGateway` lifecycle hooks
+- `packages/websockets/adapters/ws-adapter.ts` — `AbstractWsAdapter`
+- `packages/platform-socket.io/adapters/io-adapter.ts` — `IoAdapter`
+- `packages/platform-ws/adapters/ws-adapter.ts` — `WsAdapter`
+- `packages/core/nest-application.ts` — `useWebSocketAdapter`

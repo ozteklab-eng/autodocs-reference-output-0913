@@ -1,0 +1,239 @@
+---
+title: "NestJS Application Lifecycle: From create() to First Request"
+sidebarTitle: "Application Lifecycle"
+description: "What happens after NestFactory.create() returns, including init(), listen(), and the ordered sequence that loads modules, registers routes, and opens the HTTP server."
+---
+
+After `NestFactory.create()` resolves, the returned `NestApplication` instance has already scanned modules, instantiated dependencies, and applied application providers. But the application is not yet accepting requests. At commit `a3a31b9`, the transition from a constructed object to a running server happens inside `NestApplication.init()` in `packages/core/nest-application.ts`, followed by `listen()`.
+
+## Initialization sequence
+
+The `init()` method at line 177 of `packages/core/nest-application.ts` runs the following steps in strict order:
+
+<Steps>
+  <Step title="Load optional modules">
+    `loadSocketModule()` and `loadMicroservicesModule()` are called concurrently. Both use `optionalRequire()` to lazy-load `@nestjs/websockets` and `@nestjs/microservices` only when those packages are installed.
+  </Step>
+  <Step title="Apply options">
+    `applyOptions()` merges global prefix, CORS, and versioning settings from `NestApplicationOptions` into the `ApplicationConfig`.
+  </Step>
+  <Step title="Initialize HTTP adapter">
+    `httpAdapter?.init?.()` is awaited, giving the adapter a chance to set up its internal server instance.
+  </Step>
+  <Step title="Register parser middleware">
+    When `bodyParser !== false`, `registerParserMiddleware(prefix, rawBody)` tells the adapter to mount body parsing middleware.
+  </Step>
+  <Step title="Register modules">
+    `registerModules()` registers WebSocket gateways, microservice clients, and middleware configurations.
+  </Step>
+  <Step title="Register router">
+    `registerRouter()` mounts middleware first, then resolves and registers all HTTP routes.
+  </Step>
+  <Step title="Call init hooks">
+    `callInitHook()` fires `onModuleInit` on every provider, controller, injectable, and middleware in ascending hierarchy order.
+  </Step>
+  <Step title="Register router hooks">
+    `registerRouterHooks()` attaches the 404 not-found handler and the global exception handler.
+  </Step>
+  <Step title="Call bootstrap hooks">
+    `callBootstrapHook()` fires `onApplicationBootstrap` on the same instances.
+  </Step>
+</Steps>
+
+After `init()` completes, `this.isInitialized` is set to `true` and the application logs `APPLICATION_READY`.
+
+## Router registration and conflict policies
+
+`registerRouter()` is the most complex step. It decides whether to stream routes directly to the adapter or to collect them first for analysis and reordering:
+
+```ts packages/core/nest-application.ts
+public async registerRouter() {
+  await this.registerMiddleware(this.httpAdapter);
+
+  const prefix = this.config.getGlobalPrefix();
+  const basePath = addLeadingSlash(prefix);
+
+  const conflictPolicy = this.config.getRouteConflictPolicy();
+  const resolutionStrategy = this.config.getRouteResolutionStrategy();
+  const adapterIsOrderSensitive =
+    this.httpAdapter.isRouteOrderSensitive?.() ?? true;
+  const shouldSortBySpecificity =
+    resolutionStrategy === 'specificity' && adapterIsOrderSensitive;
+  const adapterRejectsDuplicates = !adapterIsOrderSensitive;
+
+  if (!conflictPolicy && !shouldSortBySpecificity) {
+    this.routesResolver.resolve(this.httpAdapter, basePath);
+    return;
+  }
+
+  const resolvedRoutes: ResolvedRoute[] = [];
+  this.routesResolver.resolve(this.httpAdapter, basePath, {
+    onRouteResolved: route => resolvedRoutes.push(route),
+    deferRegistration: true,
+  });
+
+  const orderedRoutes = shouldSortBySpecificity
+    ? RouteSpecificitySorter.sort(resolvedRoutes)
+    : resolvedRoutes;
+
+  const routesToSkip = new Set<ResolvedRoute>();
+  if (conflictPolicy) {
+    const filteredPolicy = adapterIsOrderSensitive
+      ? conflictPolicy
+      : { duplicate: conflictPolicy.duplicate };
+
+    const conflicts = RouteConflictDetector.detect(
+      orderedRoutes,
+      this.config.getVersioning(),
+    );
+
+    if (adapterRejectsDuplicates) {
+      conflicts.forEach(conflict => {
+        if (conflict.kind === 'duplicate') {
+          routesToSkip.add(conflict.shadowed);
+        }
+      });
+    }
+
+    const effectiveConflicts = shouldSortBySpecificity
+      ? RouteConflictDetector.filterSortResolvedShadows(
+          conflicts,
+          resolvedRoutes,
+        )
+      : conflicts;
+
+    RouteConflictDetector.handle(
+      effectiveConflicts,
+      filteredPolicy,
+      this.logger,
+    );
+  }
+
+  orderedRoutes.forEach(route => {
+    if (routesToSkip.has(route)) return;
+    this.routesResolver.registerResolvedRoute(this.httpAdapter, route);
+  });
+}
+```
+
+The behavior branches on two configuration properties:
+
+- `routeConflictPolicy`: When set, routes are collected into a `ResolvedRoute[]` array so `RouteConflictDetector` can find duplicates and shadowed paths before the adapter sees them. This is necessary because adapters like Fastify throw synchronously on duplicate registrations.
+- `routeResolutionStrategy`: When set to `'specificity'` and the adapter is order-sensitive, `RouteSpecificitySorter.sort()` reorders routes so more specific paths are registered first.
+
+If neither policy nor specificity sorting is enabled, routes are streamed directly to the adapter without collection.
+
+## Starting the server
+
+`listen()` opens the underlying HTTP server only after `init()` has completed:
+
+```ts packages/core/nest-application.ts
+public async listen(port: number | string, ...args: any[]): Promise<any> {
+  this.assertNotInPreviewMode('listen');
+
+  if (!this.isInitialized) {
+    await this.init();
+  }
+
+  const httpAdapterHost = this.container.getHttpAdapterHostRef();
+  return new Promise((resolve, reject) => {
+    const errorHandler = (e: any) => {
+      this.logger.error(e?.toString?.());
+      reject(e);
+    };
+    this.httpServer.once('error', errorHandler);
+
+    const isCallbackInOriginalArgs = isFunction(args[args.length - 1]);
+    const listenFnArgs = isCallbackInOriginalArgs
+      ? args.slice(0, args.length - 1)
+      : args;
+
+    this.httpAdapter.listen(
+      port,
+      ...listenFnArgs,
+      (...originalCallbackArgs: unknown[]) => {
+        if (this.appOptions?.autoFlushLogs ?? true) {
+          this.flushLogs();
+        }
+        if (originalCallbackArgs[0] instanceof Error) {
+          return reject(originalCallbackArgs[0]);
+        }
+
+        const address = this.httpServer.address();
+        if (address) {
+          this.httpServer.removeListener('error', errorHandler);
+          this.isListening = true;
+
+          httpAdapterHost.listening = true;
+          resolve(this.httpServer);
+        }
+        if (isCallbackInOriginalArgs) {
+          args[args.length - 1](...originalCallbackArgs);
+        }
+      },
+    );
+  });
+}
+```
+
+If `init()` has not been called yet, `listen()` triggers it automatically. The method wraps the adapter's `listen()` call in a Promise, attaches a one-time error handler, flushes logs on success, and sets `httpAdapterHost.listening = true`.
+
+## Shutdown sequence
+
+Shutdown is coordinated by `NestApplicationContext.close()` in `packages/core/nest-application-context.ts`:
+
+```ts packages/core/nest-application-context.ts
+public async close(signal?: string): Promise<void> {
+  await this.initializationPromise;
+  await this.prepareClose();
+  await this.callDestroyHook();
+  await this.callBeforeShutdownHook(signal);
+  await this.dispose();
+  await this.callShutdownHook(signal);
+  this.unsubscribeFromProcessSignals();
+}
+```
+
+For `NestApplication`, `prepareClose()` calls `httpAdapter.beforeClose()` if it exists, and `dispose()` closes the WebSocket module, microservices module, HTTP adapter, and any connected microservices in parallel:
+
+```ts packages/core/nest-application.ts
+protected async dispose(): Promise<void> {
+  await this.socketModule?.close();
+  await this.microservicesModule?.close();
+  await this.httpAdapter?.close();
+
+  await Promise.all(
+    iterate(this.microservices).map(async microservice => {
+      microservice.setIsTerminated(true);
+      await microservice.close();
+    }),
+  );
+}
+```
+
+### Shutdown hooks via signals
+
+You can enable automatic shutdown on process signals by calling `enableShutdownHooks()` on the application context:
+
+```ts packages/core/nest-application-context.ts
+public enableShutdownHooks(
+  signals: (ShutdownSignal | string)[] = [],
+  options: ShutdownHooksOptions = {},
+): this {
+  if (!signals || isEmptyArray(signals)) {
+    signals = Object.values(ShutdownSignal);
+  } else {
+    signals = Array.from(new Set(signals));
+  }
+
+  signals = iterate(signals)
+    .map((signal: string) => signal.toString().toUpperCase().trim())
+    .filter(signal => !this.activeShutdownSignals.includes(signal))
+    .toArray();
+
+  this.listenToShutdownSignals(signals, options);
+  return this;
+}
+```
+
+When a registered signal is received, the same ordered shutdown sequence runs: `prepareClose` → `callDestroyHook` → `callBeforeShutdownHook` → `dispose` → `callShutdownHook`. Afterward, the process either exits with code `0` (if `useProcessExit: true`) or re-sends the signal to itself via `process.kill`.

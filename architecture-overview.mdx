@@ -1,0 +1,75 @@
+---
+title: "NestJS Architecture Overview"
+sidebarTitle: "Architecture Overview"
+description: "How the Nest packages are layered, which package owns which runtime concern, and how the core composes an application from them."
+---
+
+NestJS is a monorepo of small, layered packages. `@nestjs/core` owns the runtime: the module graph, DI container, HTTP router, and lifecycle. Everything else plugs into it through published extension points.
+
+## Package layout
+
+Source lives under `packages/` in the repository:
+
+| Package | Path | Responsibility |
+| --- | --- | --- |
+| `@nestjs/common` | `packages/common` | Decorators (`@Module`, `@Injectable`, `@Controller`, HTTP verb decorators), built-in pipes, interfaces, and cross-cutting utilities. Runtime-agnostic. |
+| `@nestjs/core` | `packages/core` | `NestFactory`, `NestContainer`, `Injector`, `DependenciesScanner`, HTTP router, middleware module, lifecycle hook dispatch, REPL. |
+| `@nestjs/platform-express` | `packages/platform-express` | `ExpressAdapter` implementing `AbstractHttpAdapter` on top of Express 5. |
+| `@nestjs/platform-fastify` | `packages/platform-fastify` | `FastifyAdapter` implementing `AbstractHttpAdapter` on top of Fastify 5. |
+| `@nestjs/websockets` | `packages/websockets` | `SocketModule`, `WebSocketsController`, `WebSocketGateway` / `SubscribeMessage` decorators, and the adapter contract. |
+| `@nestjs/platform-socket.io` | `packages/platform-socket.io` | Socket.IO implementation of the WebSocket adapter. |
+| `@nestjs/platform-ws` | `packages/platform-ws` | `ws` implementation of the WebSocket adapter. |
+| `@nestjs/microservices` | `packages/microservices` | `NestMicroservice`, transport servers/clients (TCP, Redis, NATS, MQTT, gRPC, RabbitMQ, Kafka), and RPC decorators. |
+| `@nestjs/testing` | `packages/testing` | `Test.createTestingModule`, override APIs, and a testing-aware injector. |
+
+Package metadata is declared in `package.json` at the repo root and in each `packages/*/package.json`.
+
+## How the core composes an application
+
+The entry point is `NestFactory` in `packages/core/nest-factory.ts`. `NestFactory.create(RootModule, options?)` produces a `NestApplication` (defined in `packages/core/nest-application.ts`) by wiring together five subsystems:
+
+<Steps>
+  <Step title="Configuration and container">
+    A new `ApplicationConfig` (`packages/core/application-config.ts`) and `NestContainer` (`packages/core/injector/container.ts`) are constructed. The container owns modules, global modules, dynamic-module metadata, the compiled module graph, and the HTTP adapter reference.
+  </Step>
+  <Step title="Platform adapter">
+    If no adapter is passed, `NestFactoryStatic.createHttpAdapter` dynamically imports `@nestjs/platform-express` and instantiates `ExpressAdapter`. When an adapter is passed, `isHttpServer` detects it by presence of the `patch` method.
+  </Step>
+  <Step title="Dependency scanning">
+    `DependenciesScanner` (`packages/core/scanner.ts`) recursively walks `@Module` metadata, registers modules with the container, resolves dynamic modules and forward refs, and applies module overrides. It also seeds the `InternalCoreModule`, which provides framework-scoped tokens like `ModuleRef` and the request-scoped `REQUEST`/`INQUIRER`.
+  </Step>
+  <Step title="Instance instantiation">
+    `InstanceLoader` (`packages/core/injector/instance-loader.ts`) drives `Injector` (`packages/core/injector/injector.ts`) to create prototypes and then instances of providers, controllers, and injectables in each module, in parallel per module.
+  </Step>
+  <Step title="Application providers">
+    `DependenciesScanner.applyApplicationProviders` binds providers registered with the `APP_FILTER`, `APP_GUARD`, `APP_INTERCEPTOR`, and `APP_PIPE` tokens (declared in `packages/core/constants.ts`) as globally scoped enhancers on `ApplicationConfig`.
+  </Step>
+</Steps>
+
+`NestApplication.init` (`packages/core/nest-application.ts`) then lazy-loads the optional WebSocket and microservices modules with `loadPackage`, registers parser middleware, resolves and registers routes via `RoutesResolver`, and dispatches `onModuleInit` and `onApplicationBootstrap` hooks.
+
+## Layering rules the repo enforces
+
+- Platform packages depend on `@nestjs/core` and re-use exports from `@nestjs/core/internal` (see `packages/core/internal.ts`). They never import from each other.
+- WebSocket and microservices are lazy-loaded from `@nestjs/core` through `loadPackage` (`packages/common/utils/load-package.util.ts`) so a plain HTTP app does not need them installed.
+- `@nestjs/common` never imports from `@nestjs/core`. Every decorator writes metadata that the core reads back via `Reflect.getMetadata`.
+
+## What lives where
+
+<CardGroup cols={2}>
+  <Card title="Bootstrap flow" icon="rocket" href="/bootstrap/nest-factory">
+    `NestFactory`, scanning, instance loading, and how the application becomes ready to listen.
+  </Card>
+
+  <Card title="Module graph & DI" icon="puzzle" href="/di/modules-and-container">
+    `NestContainer`, `Module`, and how imports/exports/providers/controllers are stored.
+  </Card>
+
+  <Card title="Request lifecycle" icon="globe" href="/http/request-lifecycle">
+    The exact order in which middleware, guards, pipes, the handler, interceptors, and filters execute.
+  </Card>
+
+  <Card title="Adapter contract" icon="gear" href="/adapters/http-adapter">
+    `AbstractHttpAdapter` and how platform packages implement it.
+  </Card>
+</CardGroup>

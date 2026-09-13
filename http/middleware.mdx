@@ -1,0 +1,227 @@
+---
+title: "NestJS Middleware: Registration, Binding, and Execution Order"
+sidebarTitle: "Middleware"
+description: "Learn how NestJS registers and binds middleware through MiddlewareModule, MiddlewareBuilder, MiddlewareContainer, RoutesMapper, and RouteInfoPathExtractor, including class vs functional middleware and parser middleware."
+---
+
+NestJS middleware runs before route handlers and can modify the request, response, or short-circuit the pipeline. This page explains how middleware is configured per module, collected into a container, sorted by module distance, and bound to the underlying HTTP adapter.
+
+## MiddlewareModule: the registration pipeline
+
+`MiddlewareModule` in `packages/core/middleware/middleware-module.ts` orchestrates the entire middleware lifecycle. Its `register` method wires the container, config, injector, and adapter, then calls `resolveMiddleware` for every module.
+
+```ts packages/core/middleware/middleware-module.ts
+public async register(
+  middlewareContainer: MiddlewareContainer,
+  container: NestContainer,
+  config: ApplicationConfig,
+  injector: Injector,
+  httpAdapter: HttpServer,
+  graphInspector: GraphInspector,
+  options: TAppOptions,
+) {
+  // ... wiring fields ...
+  const modules = container.getModules();
+  await this.resolveMiddleware(middlewareContainer, modules);
+}
+```
+
+### Loading configuration per module
+
+`loadConfiguration` checks whether the module class has a `configure(builder)` method. If so, it creates a fresh `MiddlewareBuilder`, calls the module's `configure`, and inserts the built configuration into the `MiddlewareContainer`.
+
+```ts packages/core/middleware/middleware-module.ts
+public async loadConfiguration(
+  middlewareContainer: MiddlewareContainer,
+  moduleRef: Module,
+  moduleKey: string,
+) {
+  const { instance } = moduleRef;
+  if (!instance.configure) {
+    return;
+  }
+  const middlewareBuilder = new MiddlewareBuilder(
+    this.routesMapper, this.httpAdapter, this.routeInfoPathExtractor,
+  );
+  try {
+    await instance.configure(middlewareBuilder);
+  } catch (err) {
+    if (!this.appOptions.preview) {
+      throw err;
+    }
+    // warn in preview mode
+  }
+
+  if (!(middlewareBuilder instanceof MiddlewareBuilder)) {
+    return;
+  }
+  const config = middlewareBuilder.build();
+  middlewareContainer.insertConfig(config, moduleKey);
+}
+```
+
+### Registering middleware by module distance
+
+`registerMiddleware` sorts configurations by module distance. Global modules (`distance === Number.MAX_VALUE`) are registered first, followed by modules from shallowest to deepest in the dependency tree.
+
+```ts packages/core/middleware/middleware-module.ts
+const entriesSortedByDistance = [...configs.entries()].sort(
+  ([moduleA], [moduleB]) => {
+    const moduleARef = this.container.getModuleByKey(moduleA)!;
+    const moduleBRef = this.container.getModuleByKey(moduleB)!;
+    const isModuleAGlobal = moduleARef.distance === Number.MAX_VALUE;
+    const isModuleBGlobal = moduleBRef.distance === Number.MAX_VALUE;
+    if (isModuleAGlobal && isModuleBGlobal) return 0;
+    if (isModuleAGlobal) return -1;
+    if (isModuleBGlobal) return 1;
+    return moduleARef.distance - moduleBRef.distance;
+  },
+);
+```
+
+### Binding handlers to the adapter
+
+`registerRouteMiddleware` resolves each middleware entry and calls `bindHandler`, which:
+
+1. Validates that the instance has a `use` method.
+2. For static middleware, creates a proxy and registers it.
+3. For request-scoped middleware, builds a per-request instance via `Injector.loadPerContext`.
+4. Attaches the final handler to the HTTP adapter via `applicationRef.use(routePath, handler)`.
+
+```ts packages/core/middleware/middleware-module.ts
+private async bindHandler(
+  wrapper: InstanceWrapper<NestMiddleware>,
+  applicationRef: HttpServer,
+  routeInfo: RouteInfo,
+  moduleRef: Module,
+  collection: Map<InjectionToken, InstanceWrapper>,
+) {
+  const { instance, metatype } = wrapper;
+  if (isUndefined(instance?.use)) {
+    throw new InvalidMiddlewareException(metatype!.name);
+  }
+  const isStatic = wrapper.isDependencyTreeStatic();
+  if (isStatic) {
+    const proxy = await this.createProxy(instance);
+    return this.registerHandler(applicationRef, routeInfo, proxy);
+  }
+  // ... request-scoped path ...
+}
+```
+
+## MiddlewareBuilder: the consumer API
+
+`MiddlewareBuilder` in `packages/core/middleware/builder.ts` implements `MiddlewareConsumer`. Calling `apply(...middleware)` returns an internal `ConfigProxy` with two chainable methods:
+
+- `forRoutes(...routes)`: defines which routes the middleware applies to.
+- `exclude(...routes)`: defines routes to skip.
+
+`build()` returns the final `MiddlewareConfiguration[]` array.
+
+```ts packages/core/middleware/builder.ts
+public apply(
+  ...middleware: Array<Type<any> | Function | Array<Type<any> | Function>>
+): MiddlewareConfigProxy {
+  return new MiddlewareBuilder.ConfigProxy(
+    this, middleware.flat(), this.routeInfoPathExtractor,
+  );
+}
+
+public build(): MiddlewareConfiguration[] {
+  return [...this.middlewareCollection];
+}
+```
+
+The `ConfigProxy.forRoutes` method flattens routes, removes overlapping entries, and stores the configuration.
+
+## MiddlewareContainer: storing configurations
+
+`MiddlewareContainer` in `packages/core/middleware/container.ts` holds two maps:
+
+- `middleware`: per-module maps of token to `InstanceWrapper`.
+- `configurationSets`: per-module sets of `MiddlewareConfiguration`.
+
+`insertConfig` adds each middleware metatype as an `InstanceWrapper` and stores the configuration.
+
+```ts packages/core/middleware/container.ts
+public insertConfig(configList: MiddlewareConfiguration[], moduleKey: string) {
+  const middleware = this.getMiddlewareCollection(moduleKey);
+  const targetConfig = this.getTargetConfig(moduleKey)!;
+
+  const insertMiddleware = <T extends Type<unknown>>(metatype: T) => {
+    const token = metatype;
+    middleware.set(token, new InstanceWrapper({
+      scope: getClassScope(metatype),
+      durable: isDurable(metatype),
+      name: token?.name ?? token,
+      metatype,
+      token,
+    }));
+  };
+  configurations.forEach(config => {
+    [].concat(config.middleware).map(insertMiddleware);
+    targetConfig.add(config);
+  });
+}
+```
+
+## RoutesMapper: expanding controllers into routes
+
+`RoutesMapper` in `packages/core/middleware/routes-mapper.ts` converts `Type<Controller>` or `RouteInfo` objects into concrete `RouteInfo[]` entries. It reads `PATH_METADATA` and `VERSION_METADATA` from the controller and expands every method path into a full route entry.
+
+```ts packages/core/middleware/routes-mapper.ts
+public mapRouteToRouteInfo(
+  controllerOrRoute: Type<any> | RouteInfo | string,
+): RouteInfo[] {
+  if (isString(controllerOrRoute)) {
+    return this.getRouteInfoFromPath(controllerOrRoute);
+  }
+  const routePathOrPaths = this.getRoutePath(controllerOrRoute);
+  if (this.isRouteInfo(routePathOrPaths, controllerOrRoute)) {
+    return this.getRouteInfoFromObject(controllerOrRoute);
+  }
+  return this.getRouteInfoFromController(controllerOrRoute, routePathOrPaths!);
+}
+```
+
+## RouteInfoPathExtractor: prefix and versioning
+
+`RouteInfoPathExtractor` in `packages/core/middleware/route-info-path-extractor.ts` prepends the global prefix and applies URI versioning to each middleware route path. It also handles wildcard paths and global-prefix exclusions.
+
+```ts packages/core/middleware/route-info-path-extractor.ts
+public extractPathsFrom({ path, method, version }: RouteInfo): string[] {
+  const versionPaths = this.extractVersionPathFrom(version);
+  if (this.isAWildcard(path)) {
+    // ... wildcard handling with prefix and version paths ...
+  }
+  return this.extractNonWildcardPathsFrom({ path, method, version });
+}
+```
+
+## Class vs functional middleware
+
+- **Class middleware** implements `NestMiddleware.use(req, res, next)` and is instantiated via the DI container. It can inject dependencies.
+- **Functional middleware** is any function with the signature `(req, res, next) => void`. It is used directly without instantiation.
+
+Both forms are accepted by `MiddlewareBuilder.apply(...)`.
+
+## Parser middleware
+
+`NestApplication.registerParserMiddleware` binds body parsers (JSON, urlencoded, and raw body when configured) before the route table is registered. This ensures parsed request bodies are available to both middleware and route handlers.
+
+```ts packages/core/nest-application.ts
+public registerParserMiddleware() {
+  const prefix = this.config.getGlobalPrefix();
+  const rawBody = !!this.appOptions?.rawBody;
+  this.httpAdapter.registerParserMiddleware(prefix, rawBody);
+}
+```
+
+## Source references
+
+- `packages/core/middleware/middleware-module.ts` — `MiddlewareModule.register`, `resolveMiddleware`, `loadConfiguration`, `registerMiddleware`, `registerRouteMiddleware`, `bindHandler`
+- `packages/core/middleware/builder.ts` — `MiddlewareBuilder.apply`, `build`, `ConfigProxy`
+- `packages/core/middleware/container.ts` — `MiddlewareContainer.insertConfig`, `getMiddlewareCollection`, `getConfigurations`
+- `packages/core/middleware/routes-mapper.ts` — `RoutesMapper.mapRouteToRouteInfo`
+- `packages/core/middleware/route-info-path-extractor.ts` — `RouteInfoPathExtractor.extractPathsFrom`
+- `packages/core/nest-application.ts` — `registerParserMiddleware`

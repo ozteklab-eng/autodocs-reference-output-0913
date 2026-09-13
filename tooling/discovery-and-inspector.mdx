@@ -1,0 +1,278 @@
+---
+title: "NestJS DiscoveryService and Graph Inspector Internals"
+sidebarTitle: "Discovery & Inspector"
+description: "Explore how NestJS discovers providers and controllers at runtime, and how the GraphInspector builds a SerializedGraph when snapshot mode is enabled."
+---
+
+NestJS exposes two complementary introspection tools: `DiscoveryService` for runtime discovery of decorated classes, and `GraphInspector` for capturing the full module graph as structured JSON. At this commit (`a3a31b9`), `DiscoveryService` walks the `ModulesContainer` to locate providers and controllers by metadata key, while `GraphInspector` hooks into the scanner and injector to record nodes and edges when `snapshot: true` is passed to `NestFactory.create` or `Test.createTestingModule`.
+
+## DiscoveryService
+
+`packages/core/discovery/discovery-service.ts` defines `DiscoveryService`, an injectable that operates over the `ModulesContainer` held by `NestContainer`.
+
+### Walking the module graph
+
+The service exposes three primary lookup methods:
+
+```ts packages/core/discovery/discovery-service.ts
+  public getProviders(
+    options: DiscoveryOptions = {},
+    modules: Module[] = this.getModules(options),
+  ): InstanceWrapper[] {
+    if ('metadataKey' in options) {
+      const providers = DiscoverableMetaHostCollection.getProvidersByMetaKey(
+        this.modulesContainer,
+        options.metadataKey!,
+      );
+      return Array.from(providers);
+    }
+
+    const providers = modules.map(item => [...item.providers.values()]);
+    return flatten(providers);
+  }
+
+  public getControllers(
+    options: DiscoveryOptions = {},
+    modules: Module[] = this.getModules(options),
+  ): InstanceWrapper[] {
+    if ('metadataKey' in options) {
+      const controllers =
+        DiscoverableMetaHostCollection.getControllersByMetaKey(
+          this.modulesContainer,
+          options.metadataKey!,
+        );
+      return Array.from(controllers);
+    }
+
+    const controllers = modules.map(item => [...item.controllers.values()]);
+    return flatten(controllers);
+  }
+```
+
+When called without a `metadataKey`, `getProviders` and `getControllers` return every `InstanceWrapper` in the requested modules. When a `metadataKey` is provided, the service delegates to `DiscoverableMetaHostCollection`, which maintains weak maps from metadata keys to provider and controller sets per `ModulesContainer`.
+
+### Filtering by module whitelist
+
+`getModules` respects an `include` option that restricts discovery to specific module classes:
+
+```ts packages/core/discovery/discovery-service.ts
+  protected getModules(options: DiscoveryOptions = {}): Module[] {
+    const includeInOpts = 'include' in options;
+    if (!includeInOpts) {
+      const moduleRefs = [...this.modulesContainer.values()];
+      return moduleRefs;
+    }
+    const whitelisted = this.includeWhitelisted(options.include!);
+    return whitelisted;
+  }
+
+  private includeWhitelisted(include: Function[]): Module[] {
+    const moduleRefs = [...this.modulesContainer.values()];
+    return moduleRefs.filter(({ metatype }) =>
+      include.some(item => item === metatype),
+    );
+  }
+```
+
+### Custom decorators and metadata retrieval
+
+`DiscoveryService.createDecorator` returns a decorator factory that both attaches metadata and registers the class in the discoverable collection:
+
+```ts packages/core/discovery/discovery-service.ts
+  static createDecorator<T>(): DiscoverableDecorator<T> {
+    const metadataKey = uid(21);
+    const decoratorFn =
+      (opts: T) =>
+      (target: object | Function, key?: string | symbol, descriptor?: any) => {
+        if (!descriptor) {
+          DiscoverableMetaHostCollection.addClassMetaHostLink(
+            target as Function,
+            metadataKey,
+          );
+        }
+        SetMetadata(metadataKey, opts ?? {})(target, key!, descriptor);
+      };
+
+    decoratorFn.KEY = metadataKey;
+    return decoratorFn as DiscoverableDecorator<T>;
+  }
+```
+
+The generated `metadataKey` is a 21-character random string. When the decorator is applied to a class (not a method), `DiscoverableMetaHostCollection.addClassMetaHostLink` stores a mapping from the class constructor to that key. Later, during module scanning, the collection inspects each `InstanceWrapper` and adds it to the appropriate provider or controller set if its constructor carries a known key.
+
+To read back the metadata, use `getMetadataByDecorator`:
+
+```ts packages/core/discovery/discovery-service.ts
+  public getMetadataByDecorator<T extends DiscoverableDecorator<any>>(
+    decorator: T,
+    instanceWrapper: InstanceWrapper,
+    methodKey?: string,
+  ): T extends DiscoverableDecorator<infer R> ? R | undefined : T | undefined {
+    if (methodKey) {
+      return Reflect.getMetadata(
+        decorator.KEY,
+        instanceWrapper.instance[methodKey],
+      );
+    }
+
+    const clsRef =
+      instanceWrapper.instance?.constructor ?? instanceWrapper.metatype;
+    return Reflect.getMetadata(decorator.KEY, clsRef);
+  }
+```
+
+If you pass a `methodKey`, it reads metadata from the method on the already-instantiated instance. Otherwise it falls back to the wrapper's `metatype` or `instance.constructor`.
+
+## GraphInspector and SerializedGraph
+
+When `snapshot: true` is enabled, `NestFactoryStatic.createGraphInspector` instantiates the real `GraphInspector` instead of `NoopGraphInspector`. The inspector participates in three phases:
+
+1. **Module scanning** — `inspectModules` records every module, provider, injectable, and controller as a node, and every import relationship as an edge.
+2. **Instance creation** — `inspectInstanceWrapper` records constructor parameter and property injection edges between wrappers.
+3. **Enhancer binding** — `insertEnhancerMetadataCache` records which guards, pipes, interceptors, and filters are attached to each controller or route.
+
+### Graph structure
+
+`packages/core/inspector/serialized-graph.ts` defines `SerializedGraph`, a container for nodes, edges, entrypoints, and orphaned enhancers:
+
+```ts packages/core/inspector/serialized-graph.ts
+export class SerializedGraph {
+  private readonly nodes = new Map<string, Node>();
+  private readonly edges = new Map<string, Edge>();
+  private readonly entrypoints = new Map<string, Entrypoint<unknown>[]>();
+  private readonly extras: Extras = {
+    orphanedEnhancers: [],
+    attachedEnhancers: [],
+  };
+  private _status: SerializedGraphStatus = 'complete';
+  private _metadata?: SerializedGraphMetadata;
+```
+
+The graph exposes `toJSON()`, which converts the internal maps into plain objects suitable for serialization. It also tracks a `status` field: if an `UnknownDependenciesException` occurs during instantiation, the inspector calls `registerPartial(error)` and sets `status` to `'partial'` so the output still reflects whatever could be scanned before the failure.
+
+### Module and class nodes
+
+`inspectModules` iterates the `ModulesContainer` and inserts one node per module and one per class:
+
+```ts packages/core/inspector/graph-inspector.ts
+  public inspectModules(
+    modules: Map<string, Module> = this.container.getModules(),
+  ) {
+    for (const moduleRef of modules.values()) {
+      this.insertModuleNode(moduleRef);
+      this.insertClassNodes(moduleRef);
+      this.insertModuleToModuleEdges(moduleRef);
+    }
+
+    this.enhancersMetadataCache.forEach(entry =>
+      this.insertEnhancerEdge(entry),
+    );
+
+    DeterministicUuidRegistry.clear();
+  }
+```
+
+`insertClassNode` captures scope, durability, static-tree status, export status, and initialization timing:
+
+```ts packages/core/inspector/graph-inspector.ts
+  public insertClassNode(
+    moduleRef: Module,
+    wrapper: InstanceWrapper,
+    type: Exclude<Node['metadata']['type'], 'module'>,
+  ) {
+    this.graph.insertNode({
+      id: wrapper.id,
+      label: wrapper.name,
+      parent: moduleRef.id,
+      metadata: {
+        type,
+        internal: wrapper.metatype === moduleRef.metatype,
+        sourceModuleName: moduleRef.name,
+        durable: wrapper.isDependencyTreeDurable(),
+        static: wrapper.isDependencyTreeStatic(),
+        scope: wrapper.scope!,
+        transient: wrapper.isTransient,
+        exported: moduleRef.exports.has(wrapper.token),
+        token: wrapper.token,
+        subtype: wrapper.subtype,
+        initTime: wrapper.initTime!,
+      },
+    });
+  }
+```
+
+The `initTime` field comes from `Injector.loadInstance` in `packages/core/injector/injector.ts`, which records how long each wrapper took to instantiate:
+
+```ts packages/core/injector/injector.ts
+        wrapper.hierarchyLevel = depth + 1;
+        wrapper.initTime = this.getNowTimestamp() - t0;
+```
+
+### Injection edges
+
+`inspectInstanceWrapper` reads constructor metadata and property metadata from the wrapper to build `class-to-class` edges:
+
+```ts packages/core/inspector/graph-inspector.ts
+  public inspectInstanceWrapper<T = any>(
+    source: InstanceWrapper<T>,
+    moduleRef: Module,
+  ) {
+    const ctorMetadata = source.getCtorMetadata();
+    ctorMetadata?.forEach((target, index) =>
+      this.insertClassToClassEdge(
+        source,
+        target,
+        moduleRef,
+        index,
+        'constructor',
+      ),
+    );
+
+    const propertiesMetadata = source.getPropertiesMetadata();
+    propertiesMetadata?.forEach(({ key, wrapper: target }) =>
+      this.insertClassToClassEdge(source, target, moduleRef, key, 'property'),
+    );
+  }
+```
+
+Each edge stores the source and target class names, tokens, module names, and the injection type (`constructor`, `property`, or `decorator` for enhancers).
+
+### Enhancer edges
+
+`insertEnhancerMetadataCache` is called by the router and interceptor context creators after they resolve enhancer instances. The inspector stores the entry in a cache array and flushes it during `inspectModules`:
+
+```ts packages/core/inspector/graph-inspector.ts
+  public insertEnhancerMetadataCache(entry: EnhancerMetadataCacheEntry) {
+    this.enhancersMetadataCache.push(entry);
+  }
+```
+
+When flushed, each entry becomes either a real `class-to-class` edge (if the enhancer was resolved to an `InstanceWrapper`) or an orphaned enhancer entry (if only a class reference or function was available). The resulting node metadata includes an `enhancers` array with ids, method keys, and subtypes such as `guard`, `interceptor`, `pipe`, or `filter`.
+
+### NoopGraphInspector
+
+When snapshots are disabled, `NoopGraphInspector` in `packages/core/inspector/noop-graph-inspector.ts` proxies every method to a no-op function so the scanner and injector incur no graph-tracking overhead:
+
+```ts packages/core/inspector/noop-graph-inspector.ts
+const noop = () => {};
+export const NoopGraphInspector: GraphInspector = new Proxy(
+  GraphInspector.prototype,
+  {
+    get: () => noop,
+  },
+);
+```
+
+### Accessing the graph
+
+`NestContainer` owns the `SerializedGraph` instance:
+
+```ts packages/core/injector/container.ts
+  private readonly _serializedGraph = new SerializedGraph();
+
+  get serializedGraph(): SerializedGraph {
+    return this._serializedGraph;
+  }
+```
+
+When snapshot mode is active, the graph is also registered as an internal provider via `InternalCoreModuleFactory`, making it injectable if needed. You can retrieve it programmatically through the container or, in test modules, through `TestingModuleBuilder` with `snapshot: true`.

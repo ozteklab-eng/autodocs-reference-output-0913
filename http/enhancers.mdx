@@ -1,0 +1,199 @@
+---
+title: "NestJS Enhancers: Guards, Interceptors, and Pipes"
+sidebarTitle: "Enhancers"
+description: "Learn how NestJS guards, interceptors, and pipes are created, consumed, and registered globally or per-route, including support for REQUEST-scoped and TRANSIENT-scoped enhancers via InstanceWrapper."
+---
+
+NestJS uses three categories of request enhancers: guards, interceptors, and pipes. Each has a consumer that executes it at runtime and a context creator that resolves the instances to run. This page covers both the per-route resolution and the global registration paths, including how request-scoped enhancers are handled.
+
+## Guards
+
+`GuardsConsumer.tryActivate` in `packages/core/guards/guards-consumer.ts` iterates the guard array and calls `canActivate(context)` on each one. If any guard returns `false` (or an observable that resolves to `false`), the pipeline aborts with a `ForbiddenException`.
+
+```ts packages/core/guards/guards-consumer.ts
+public async tryActivate<TContext extends string = ContextType>(
+  guards: CanActivate[],
+  args: unknown[],
+  instance: Controller,
+  callback: (...args: unknown[]) => unknown,
+  type?: TContext,
+): Promise<boolean> {
+  if (!guards || isEmptyArray(guards)) {
+    return true;
+  }
+  const context = this.createContext(args, instance, callback);
+  context.setType<TContext>(type!);
+
+  for (const guard of guards) {
+    const result = guard.canActivate(context);
+    if (typeof result === 'boolean') {
+      if (!result) return false;
+      continue;
+    }
+    if (await this.pickResult(result)) {
+      continue;
+    }
+    return false;
+  }
+  return true;
+}
+```
+
+`GuardsContextCreator.create` in `packages/core/guards/guards-context-creator.ts` gathers metadata via `Reflector` and the `getGuards` collection. The resulting list merges controller-level, method-level, and global guards.
+
+```ts packages/core/guards/guards-context-creator.ts
+public create(
+  instance: Controller,
+  callback: (...args: unknown[]) => unknown,
+  module: string,
+  contextId = STATIC_CONTEXT,
+  inquirerId?: string,
+): CanActivate[] {
+  this.moduleContext = module;
+  return this.createContext(
+    instance, callback, GUARDS_METADATA, contextId, inquirerId,
+  );
+}
+```
+
+## Interceptors
+
+`InterceptorsConsumer.intercept` in `packages/core/interceptors/interceptors-consumer.ts` composes the interceptor chain using RxJS `defer`. It reduces from the last interceptor outward, so interceptor A wraps interceptor B, which wraps the handler.
+
+```ts packages/core/interceptors/interceptors-consumer.ts
+public async intercept<TContext extends string = ContextType>(
+  interceptors: NestInterceptor[],
+  args: unknown[],
+  instance: Controller,
+  callback: (...args: unknown[]) => unknown,
+  next: () => Promise<unknown>,
+  type?: TContext,
+): Promise<unknown> {
+  if (!interceptors || isEmptyArray(interceptors)) {
+    return next();
+  }
+  const context = this.createContext(args, instance, callback);
+  context.setType<TContext>(type!);
+
+  const nextFn = async (i = 0) => {
+    if (i >= interceptors.length) {
+      return defer(AsyncResource.bind(() => this.transformDeferred(next)));
+    }
+    const handler: CallHandler = {
+      handle: () => defer(AsyncResource.bind(() => nextFn(i + 1))).pipe(mergeAll()),
+    };
+    return interceptors[i].intercept(context, handler);
+  };
+  return defer(() => nextFn()).pipe(mergeAll());
+}
+```
+
+`InterceptorsContextCreator.create` in `packages/core/interceptors/interceptors-context-creator.ts` resolves controller-level, method-level, and global interceptors the same way guards are resolved.
+
+## Pipes
+
+`PipesConsumer.applyPipes` in `packages/core/pipes/pipes-consumer.ts` runs each pipe in order, passing the transformed value to the next pipe.
+
+```ts packages/core/pipes/pipes-consumer.ts
+public async applyPipes<TInput = unknown>(
+  value: TInput,
+  { metatype, type, data, schema }: ArgumentMetadata,
+  transforms: PipeTransform[],
+) {
+  let result: unknown = value;
+  for (const pipe of transforms) {
+    result = await pipe.transform(result, { metatype, type, data, schema });
+  }
+  return result;
+}
+```
+
+`PipesContextCreator.create` in `packages/core/pipes/pipes-context-creator.ts` resolves global and route-level pipes. `RouterExecutionContext` builds a per-argument pipe chain from `ParamMetadata`, concatenating global pipes with parameter-specific pipes.
+
+## Global registration paths
+
+`ApplicationConfig` in `packages/core/application-config.ts` stores enhancers at two levels:
+
+- **Direct instances**: `useGlobalGuards`, `useGlobalPipes`, `useGlobalInterceptors`, `useGlobalFilters` (and the matching `addGlobal*` variants) accept raw class instances.
+- **DI-bound wrappers**: `addGlobalRequestGuard`, `addGlobalRequestPipe`, `addGlobalRequestInterceptor`, `addGlobalRequestFilter` accept an `InstanceWrapper<...>` so that REQUEST-scoped enhancers can be resolved per request.
+
+```ts packages/core/application-config.ts
+private readonly globalRequestPipes: InstanceWrapper<PipeTransform>[] = [];
+private readonly globalRequestFilters: InstanceWrapper<ExceptionFilter>[] = [];
+private readonly globalRequestInterceptors: InstanceWrapper<NestInterceptor>[] = [];
+private readonly globalRequestGuards: InstanceWrapper<CanActivate>[] = [];
+
+public addGlobalRequestGuard(wrapper: InstanceWrapper<CanActivate>) {
+  this.globalRequestGuards.push(wrapper);
+}
+public addGlobalRequestPipe(wrapper: InstanceWrapper<PipeTransform>) {
+  this.globalRequestPipes.push(wrapper);
+}
+public addGlobalRequestInterceptor(wrapper: InstanceWrapper<NestInterceptor>) {
+  this.globalRequestInterceptors.push(wrapper);
+}
+public addGlobalRequestFilter(wrapper: InstanceWrapper<ExceptionFilter>) {
+  this.globalRequestFilters.push(wrapper);
+}
+```
+
+The tokens `APP_GUARD`, `APP_PIPE`, `APP_INTERCEPTOR`, and `APP_FILTER` in `packages/core/constants.ts` are used by the framework to identify providers that should be registered through the `addGlobalRequest*` methods.
+
+```ts packages/core/constants.ts
+export const APP_INTERCEPTOR = 'APP_INTERCEPTOR';
+export const APP_PIPE = 'APP_PIPE';
+export const APP_GUARD = 'APP_GUARD';
+export const APP_FILTER = 'APP_FILTER';
+```
+
+## Request-scoped and transient-scoped enhancers
+
+When an enhancer is `Scope.REQUEST` or `Scope.TRANSIENT`, the context creators do not use the static instance directly. Instead, they call `InstanceWrapper.getInstanceByContextId(contextId, inquirerId?)` to obtain the correct per-request instance during handler construction.
+
+For example, in `GuardsContextCreator.getGuardInstance`:
+
+```ts packages/core/guards/guards-context-creator.ts
+public getGuardInstance(
+  metatype: Function | CanActivate,
+  contextId = STATIC_CONTEXT,
+  inquirerId?: string,
+): CanActivate | null {
+  const isObject = !!(metatype as CanActivate).canActivate;
+  if (isObject) {
+    return metatype as CanActivate;
+  }
+  const instanceWrapper = this.getInstanceByMetatype(metatype as Type<unknown>);
+  if (!instanceWrapper) {
+    return null;
+  }
+  const instanceHost = instanceWrapper.getInstanceByContextId(
+    this.getContextId(contextId, instanceWrapper),
+    inquirerId,
+  );
+  return instanceHost && instanceHost.instance;
+}
+```
+
+The same pattern appears in `InterceptorsContextCreator.getInterceptorInstance` and `PipesContextCreator.getPipeInstance`.
+
+## Property-level decorators
+
+The decorators that attach metadata to controllers and handlers live in `packages/common/decorators/core/`:
+
+- `@UseGuards(...)` sets `GUARDS_METADATA`
+- `@UsePipes(...)` sets `PIPES_METADATA`
+- `@UseInterceptors(...)` sets `INTERCEPTORS_METADATA`
+- `@UseFilters(...)` sets `EXCEPTION_FILTERS_METADATA`
+
+These are read by the respective context creators to build the per-route enhancer list.
+
+## Source references
+
+- `packages/core/guards/guards-consumer.ts` — `GuardsConsumer.tryActivate`
+- `packages/core/guards/guards-context-creator.ts` — `GuardsContextCreator.create`, `getGuardInstance`
+- `packages/core/interceptors/interceptors-consumer.ts` — `InterceptorsConsumer.intercept`
+- `packages/core/interceptors/interceptors-context-creator.ts` — `InterceptorsContextCreator.create`, `getInterceptorInstance`
+- `packages/core/pipes/pipes-consumer.ts` — `PipesConsumer.applyPipes`
+- `packages/core/pipes/pipes-context-creator.ts` — `PipesContextCreator.create`, `getPipeInstance`
+- `packages/core/application-config.ts` — `addGlobalRequestGuard`, `addGlobalRequestPipe`, `addGlobalRequestInterceptor`, `addGlobalRequestFilter`
+- `packages/core/constants.ts` — `APP_GUARD`, `APP_PIPE`, `APP_INTERCEPTOR`, `APP_FILTER`

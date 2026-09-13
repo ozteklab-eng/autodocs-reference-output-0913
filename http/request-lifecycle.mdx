@@ -1,0 +1,156 @@
+---
+title: "NestJS HTTP Request Lifecycle: From Middleware to Reply"
+sidebarTitle: "Request Lifecycle"
+description: "Trace the exact order an HTTP request travels through NestJS, from middleware and parser setup through guards, interceptors, pipes, handler invocation, exception filters, and the final adapter reply."
+---
+
+NestJS composes every HTTP request into a predictable pipeline. This page walks through the exact sequence, citing the core router and exception classes that build and execute it. Understanding this order helps you write enhancers (guards, interceptors, pipes, and filters) that behave correctly at each stage.
+
+<Steps>
+  <Step title="Middleware chain">
+    The underlying HTTP server (Express or Fastify) receives the request. Before route handlers run, parser middleware is registered by `NestApplication.registerParserMiddleware`, and any middleware configured via `MiddlewareBuilder` is applied. See [middleware](/http/middleware) for details.
+  </Step>
+  <Step title="Router dispatch">
+    The router matches the request to a composed handler built by `RouterExecutionContext.create` in `packages/core/router/router-execution-context.ts`. The handler is a closure that orchestrates the remaining stages.
+  </Step>
+  <Step title="Guards">
+    `GuardsConsumer.tryActivate` runs every guard for the route. If any guard returns `false`, the pipeline short-circuits with a `ForbiddenException`.
+  </Step>
+  <Step title="Interceptors (pre)">
+    `InterceptorsConsumer.intercept` wraps the rest of the call in an RxJS chain. Each interceptor can run logic before calling `next.handle()`.
+  </Step>
+  <Step title="Pipes">
+    `PipesConsumer.applyPipes` transforms each argument extracted from the request (body, query, params, headers, custom decorators) according to its metadata and attached pipes.
+  </Step>
+  <Step title="Handler">
+    The controller method is invoked with the transformed arguments.
+  </Step>
+  <Step title="Interceptors (post)">
+    After the handler returns, the interceptor chain unwinds. Each interceptor can transform the result before it reaches the response layer.
+  </Step>
+  <Step title="Serialization and reply">
+    `RouterResponseController` applies the result (render, redirect, SSE, or JSON) and calls `httpAdapter.reply(response, body, statusCode)`.
+  </Step>
+  <Step title="Exception filters (side channel)">
+    If anything throws, `ExceptionsHandler.next(exception, host)` walks the registered filter chain. Unmatched exceptions fall back to `BaseExceptionFilter`.
+  </Step>
+</Steps>
+
+## How the composed handler is built
+
+`RouterExecutionContext.create` in `packages/core/router/router-execution-context.ts` returns an async function that accepts `(req, res, next)` and performs the following:
+
+1. Builds metadata for the target method: argument length, parameter types, response handler, HTTP status code, and custom headers.
+2. Creates the guard activation function via `createGuardsFn`.
+3. Creates the per-argument pipe function via `createPipesFn`.
+4. Builds the inner handler that first applies pipes to arguments, then calls the controller method.
+5. Wraps the inner handler with interceptors via `interceptorsConsumer.intercept`.
+6. After the interceptor chain resolves, hands the result to the response controller.
+
+```ts packages/core/router/router-execution-context.ts
+public create(
+  instance: Controller,
+  callback: (...args: any[]) => unknown,
+  methodName: string,
+  moduleKey: string,
+  requestMethod: RequestMethod,
+  contextId = STATIC_CONTEXT,
+  inquirerId?: string,
+) {
+  // ... metadata extraction ...
+
+  const pipes = this.pipesContextCreator.create(
+    instance, callback, moduleKey, contextId, inquirerId,
+  );
+  const guards = this.guardsContextCreator.create(
+    instance, callback, moduleKey, contextId, inquirerId,
+  );
+  const interceptors = this.interceptorsContextCreator.create(
+    instance, callback, moduleKey, contextId, inquirerId,
+  );
+
+  const fnCanActivate = this.createGuardsFn(guards, instance, callback, contextType);
+  const fnApplyPipes = this.createPipesFn(pipes, paramsOptions);
+
+  const handler = <TRequest, TResponse>(
+    args: any[], req: TRequest, res: TResponse, next: Function,
+  ) => async () => {
+    fnApplyPipes && (await fnApplyPipes(args, req, res, next));
+    return callback.apply(instance, args);
+  };
+
+  return async <TRequest, TResponse>(req: TRequest, res: TResponse, next: Function) => {
+    const args = this.contextUtils.createNullArray(argsLength);
+    fnCanActivate && (await fnCanActivate([req, res, next]));
+
+    this.responseController.setStatus(res, httpStatusCode);
+    hasCustomHeaders && this.responseController.setHeaders(res, responseHeaders);
+
+    const resultOrDeferred = this.interceptorsConsumer.intercept(
+      interceptors, [req, res, next], instance, callback,
+      handler(args, req, res, next), contextType,
+    );
+    const result = isSseHandler ? resultOrDeferred : await resultOrDeferred;
+    await (fnHandleResponse as HandlerResponseBasicFn)(result, res, req);
+  };
+}
+```
+
+## Exception handling path
+
+When an error is thrown at any stage, it is caught by the proxy created in `RouterProxy.createProxy`. The proxy delegates to the exception handler built for that route.
+
+`ExceptionsHandler.next` in `packages/core/exceptions/exceptions-handler.ts` iterates the filter chain and invokes the first filter whose `exceptionMetatypes` matches the thrown error. If no custom filter matches, it falls back to `BaseExceptionFilter.catch` in `packages/core/exceptions/base-exception-filter.ts`, which uses the current HTTP adapter to send the reply.
+
+```ts packages/core/exceptions/exceptions-handler.ts
+public next(exception: Error | HttpException, ctx: ArgumentsHost) {
+  if (this.invokeCustomFilters(exception, ctx)) {
+    return;
+  }
+  super.catch(exception, ctx);
+}
+```
+
+`BaseExceptionFilter` distinguishes three cases:
+
+- `HttpException` instances: replies with `exception.getResponse()` and `exception.getStatus()`.
+- Framework HTTP errors (Fastify errors or `http-errors` shaped objects): replies with their `statusCode` and `message`.
+- Unknown errors: replies with status `500` and `Internal server error`, and logs the exception unless it is an `IntrinsicException`.
+
+## Pseudo-code summary
+
+```ts
+async function composedHandler(req, res, next) {
+  // 1. Guards
+  const allowed = await guardsConsumer.tryActivate(guards, [req, res, next], instance, callback);
+  if (!allowed) throw new ForbiddenException();
+
+  // 2. Interceptors wrap pipes + handler
+  const result = await interceptorsConsumer.intercept(
+    interceptors,
+    [req, res, next],
+    instance,
+    callback,
+    async () => {
+      // 3. Pipes per argument
+      const args = await applyPipes(extractParams(req, res, next), paramsOptions);
+      // 4. Handler
+      return callback.apply(instance, args);
+    },
+    'http',
+  );
+
+  // 5. Reply
+  await responseController.apply(result, res);
+}
+```
+
+## Source references
+
+- `packages/core/router/router-execution-context.ts` — `RouterExecutionContext.create`, `createGuardsFn`, `createPipesFn`
+- `packages/core/guards/guards-consumer.ts` — `GuardsConsumer.tryActivate`
+- `packages/core/interceptors/interceptors-consumer.ts` — `InterceptorsConsumer.intercept`
+- `packages/core/pipes/pipes-consumer.ts` — `PipesConsumer.applyPipes`
+- `packages/core/exceptions/exceptions-handler.ts` — `ExceptionsHandler.next`
+- `packages/core/exceptions/base-exception-filter.ts` — `BaseExceptionFilter.catch`, `handleUnknownError`, `isHttpError`
+- `packages/core/nest-application.ts` — `registerParserMiddleware`

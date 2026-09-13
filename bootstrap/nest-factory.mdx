@@ -1,0 +1,358 @@
+---
+title: "NestFactory: Entry Point for Applications, Microservices, and Contexts"
+sidebarTitle: "NestFactory"
+description: "How NestFactoryStatic.create, createMicroservice, and createApplicationContext bootstrap a NestJS application by delegating to a shared initialize() method."
+---
+
+`NestFactoryStatic` is the single entry point for every NestJS bootstrap path. Whether you are starting an HTTP application, a standalone microservice, or a lightweight application context, the same initialization sequence runs. At commit `a3a31b9`, the class lives in `packages/core/nest-factory.ts` and exposes three public methods that all converge on a private `initialize()` routine.
+
+## The three public creation methods
+
+Each method follows the same pattern: create an `ApplicationConfig`, create a `NestContainer`, create a `GraphInspector`, set error and logger options, call `initialize()`, and return the instance wrapped in a Proxy.
+
+### `create()` — HTTP applications
+
+```ts packages/core/nest-factory.ts
+public async create<T extends INestApplication = INestApplication>(
+  moduleCls: IEntryNestModule,
+  serverOrOptions?: AbstractHttpAdapter | NestApplicationOptions,
+  options?: NestApplicationOptions,
+): Promise<T> {
+  const [httpServer, appOptions] = this.isHttpServer(serverOrOptions!)
+    ? [serverOrOptions, options]
+    : [await this.createHttpAdapter(), serverOrOptions];
+
+  const applicationConfig = new ApplicationConfig();
+  const container = new NestContainer(applicationConfig, appOptions);
+  const graphInspector = this.createGraphInspector(appOptions!, container);
+
+  this.setAbortOnError(serverOrOptions, options);
+  this.registerLoggerConfiguration(appOptions);
+
+  await this.initialize(
+    moduleCls,
+    container,
+    graphInspector,
+    applicationConfig,
+    appOptions,
+    httpServer,
+  );
+
+  const instance = new NestApplication(
+    container,
+    httpServer,
+    applicationConfig,
+    graphInspector,
+    appOptions,
+  );
+  await instance.preloadLazyPackages();
+  const target = this.createNestInstance(instance);
+  return this.createAdapterProxy<T>(target, httpServer);
+}
+```
+
+If you pass an `AbstractHttpAdapter` as the second argument, `create()` uses it directly. Otherwise it awaits `createHttpAdapter()`, which falls back to `ExpressAdapter` from `@nestjs/platform-express`.
+
+### `createMicroservice()` — Microservices
+
+```ts packages/core/nest-factory.ts
+public async createMicroservice<T extends object>(
+  moduleCls: IEntryNestModule,
+  options?: NestMicroserviceOptions & T,
+): Promise<INestMicroservice> {
+  const { NestMicroservice } = await loadPackage(
+    '@nestjs/microservices',
+    'NestFactory',
+    () => import('@nestjs/microservices'),
+  );
+  const applicationConfig = new ApplicationConfig();
+  const container = new NestContainer(applicationConfig, options);
+  const graphInspector = this.createGraphInspector(options!, container);
+
+  this.setAbortOnError(options);
+  this.registerLoggerConfiguration(options);
+
+  await this.initialize(
+    moduleCls,
+    container,
+    graphInspector,
+    applicationConfig,
+    options,
+  );
+  return this.createNestInstance<INestMicroservice>(
+    new NestMicroservice(
+      container,
+      options,
+      graphInspector,
+      applicationConfig,
+    ),
+  );
+}
+```
+
+This method lazy-loads the `@nestjs/microservices` package and skips HTTP adapter creation entirely.
+
+### `createApplicationContext()` — Standalone DI container
+
+```ts packages/core/nest-factory.ts
+public async createApplicationContext(
+  moduleCls: IEntryNestModule,
+  options?: NestApplicationContextOptions,
+): Promise<INestApplicationContext> {
+  const applicationConfig = new ApplicationConfig();
+  const container = new NestContainer(applicationConfig, options);
+  const graphInspector = this.createGraphInspector(options!, container);
+
+  this.setAbortOnError(options);
+  this.registerLoggerConfiguration(options);
+
+  await this.initialize(
+    moduleCls,
+    container,
+    graphInspector,
+    applicationConfig,
+    options,
+  );
+
+  const modules = container.getModules().values();
+  const root = modules.next().value;
+
+  const context = this.createNestInstance<NestApplicationContext>(
+    new NestApplicationContext(container, options, root),
+  );
+  if (this.autoFlushLogs) {
+    context.flushLogsOnOverride();
+  }
+  return context.init();
+}
+```
+
+A context has no HTTP server and no router. It is useful for background workers, CLI tools, or testing scenarios where you only need the dependency injection container.
+
+## The `initialize()` method
+
+All three methods delegate to `initialize()`, which is the real bootstrap engine. It performs the following steps in order:
+
+```ts packages/core/nest-factory.ts
+private async initialize(
+  module: any,
+  container: NestContainer,
+  graphInspector: GraphInspector,
+  config = new ApplicationConfig(),
+  options: NestApplicationContextOptions = {},
+  httpServer: HttpServer | null = null,
+) {
+  UuidFactory.mode = options.snapshot
+    ? UuidFactoryMode.Deterministic
+    : UuidFactoryMode.Random;
+
+  const injector = new Injector({
+    preview: options.preview!,
+    snapshot: options.snapshot,
+    instanceDecorator: options.instrument?.instanceDecorator,
+  });
+  const instanceLoader = new InstanceLoader(
+    container,
+    injector,
+    graphInspector,
+  );
+  const metadataScanner = new MetadataScanner();
+  const dependenciesScanner = new DependenciesScanner(
+    container,
+    metadataScanner,
+    graphInspector,
+    config,
+  );
+  container.setHttpAdapter(httpServer);
+
+  const teardown = this.abortOnError === false ? rethrow : undefined;
+  await httpServer?.init?.();
+  try {
+    this.logger.log(MESSAGES.APPLICATION_START);
+
+    await ExceptionsZone.asyncRun(
+      async () => {
+        await dependenciesScanner.scan(module);
+        await instanceLoader.createInstancesOfDependencies();
+        dependenciesScanner.applyApplicationProviders();
+      },
+      teardown,
+      this.autoFlushLogs,
+    );
+  } catch (e) {
+    this.handleInitializationError(e);
+  }
+}
+```
+
+The sequence is:
+
+1. Set `UuidFactory` mode based on `snapshot` option.
+2. Create `Injector`, `InstanceLoader`, `MetadataScanner`, and `DependenciesScanner`.
+3. Attach the HTTP adapter to the container if one exists.
+4. Call `httpServer?.init?.()` if the adapter defines an async init hook.
+5. Run `ExceptionsZone.asyncRun()` around three operations: `scan()`, `createInstancesOfDependencies()`, and `applyApplicationProviders()`.
+
+If any step throws, `handleInitializationError()` either calls `process.abort()` or rethrows, depending on `abortOnError`.
+
+## Exception zones and the Proxy wrapper
+
+Every returned instance is wrapped in a Proxy so that property access and method calls are guarded by an exception zone. This is what makes NestJS surface errors in a controlled way rather than letting them bubble uncaught.
+
+### `createProxy()` and `createExceptionProxy()`
+
+```ts packages/core/nest-factory.ts
+private createProxy(target: any) {
+  const proxy = this.createExceptionProxy();
+  return new Proxy(target, {
+    get: proxy,
+    set: proxy,
+  });
+}
+
+private createExceptionProxy() {
+  return (receiver: Record<string, any>, prop: string) => {
+    if (!(prop in receiver)) {
+      return;
+    }
+    if (isFunction(receiver[prop])) {
+      return this.createExceptionZone(receiver, prop);
+    }
+    return receiver[prop];
+  };
+}
+```
+
+When you access a method on the returned application instance, the Proxy intercepts it and wraps the call inside `ExceptionsZone.run()` or `ExceptionsZone.asyncRun()`.
+
+### `createExceptionZone()`
+
+```ts packages/core/nest-factory.ts
+private createExceptionZone(
+  receiver: Record<string, any>,
+  prop: string,
+): Function {
+  const teardown = this.abortOnError === false ? rethrow : undefined;
+
+  return (...args: unknown[]) => {
+    let result: unknown;
+    ExceptionsZone.run(
+      () => {
+        result = receiver[prop](...args);
+      },
+      teardown,
+      this.autoFlushLogs,
+    );
+
+    return result;
+  };
+}
+```
+
+The `teardown` function defaults to `process.exit(1)` unless `abortOnError` is `false`, in which case it rethrows the error. This behavior is defined in `packages/core/errors/exceptions-zone.ts`:
+
+```ts packages/core/errors/exceptions-zone.ts
+const DEFAULT_TEARDOWN = () => process.exit(1);
+
+export class ExceptionsZone {
+  private static readonly exceptionHandler = new ExceptionHandler();
+
+  public static async asyncRun(
+    callback: () => Promise<void>,
+    teardown: (err: any) => void = DEFAULT_TEARDOWN,
+    autoFlushLogs: boolean,
+  ) {
+    try {
+      await callback();
+    } catch (e) {
+      this.exceptionHandler.handle(e);
+      if (autoFlushLogs) {
+        Logger.flush();
+      }
+      teardown(e);
+    }
+  }
+}
+```
+
+## Factory options
+
+The following options influence how `NestFactoryStatic` behaves during creation:
+
+| Option | Effect |
+| --- | --- |
+| `abortOnError` | When `false`, initialization errors are rethrown instead of calling `process.abort()`. |
+| `bufferLogs` | Attaches a log buffer so logs are captured before a custom logger is set. |
+| `autoFlushLogs` | Automatically flushes the log buffer after initialization and on every exception zone teardown. |
+| `snapshot` | Enables deterministic UUID generation and returns a real `GraphInspector` instead of `NoopGraphInspector`. |
+| `preview` | Runs the container in preview mode: providers and controllers are not instantiated. |
+| `instrument` | Accepts an `instanceDecorator` function that is applied to every instantiated class. |
+
+### `createGraphInspector()`
+
+```ts packages/core/nest-factory.ts
+private createGraphInspector(
+  appOptions: NestApplicationContextOptions,
+  container: NestContainer,
+) {
+  return appOptions?.snapshot
+    ? new GraphInspector(container)
+    : NoopGraphInspector;
+}
+```
+
+Unless `snapshot: true` is passed, the factory installs `NoopGraphInspector` from `packages/core/inspector/noop-graph-inspector.ts`, which skips all graph serialization work.
+
+### `createHttpAdapter()`
+
+```ts packages/core/nest-factory.ts
+private async createHttpAdapter<T = any>(
+  httpServer?: T,
+): Promise<AbstractHttpAdapter> {
+  const { ExpressAdapter } = await loadAdapter(
+    '@nestjs/platform-express',
+    'HTTP',
+    () => import('@nestjs/platform-express'),
+  );
+  return new ExpressAdapter(httpServer);
+}
+```
+
+If you do not supply an adapter, `loadAdapter()` in `packages/core/helpers/load-adapter.ts` attempts to import `@nestjs/platform-express` and falls back to `ExpressAdapter`. If the package is missing, it logs an error and exits the process.
+
+## Adapter proxy for HTTP applications
+
+HTTP applications receive an additional proxy layer, `createAdapterProxy()`, which forwards unknown property accesses to the underlying `HttpServer` adapter:
+
+```ts packages/core/nest-factory.ts
+private createAdapterProxy<T>(app: NestApplication, adapter: HttpServer): T {
+  const proxy = new Proxy(app, {
+    get: (receiver: Record<string, any>, prop: string) => {
+      const mapToProxy = (result: unknown) => {
+        return result instanceof Promise
+          ? result.then(mapToProxy)
+          : result instanceof NestApplication
+            ? proxy
+            : result;
+      };
+
+      if (!(prop in receiver) && prop in adapter) {
+        return (...args: unknown[]) => {
+          const result = this.createExceptionZone(adapter, prop)(...args);
+          return mapToProxy(result);
+        };
+      }
+      if (isFunction(receiver[prop])) {
+        return (...args: unknown[]) => {
+          const result = receiver[prop](...args);
+          return mapToProxy(result);
+        };
+      }
+      return receiver[prop];
+    },
+  });
+  return proxy as unknown as T;
+}
+```
+
+This is why calling `app.use()` on an Express-backed application actually delegates to `ExpressAdapter.use()`, while still being wrapped in an exception zone.

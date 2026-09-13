@@ -1,0 +1,168 @@
+---
+title: "Provider Scopes and Per-Request Contexts in NestJS"
+sidebarTitle: "Scopes & Context"
+description: "How NestJS DEFAULT, TRANSIENT, and REQUEST scopes work, how per-context instances are stored in InstanceWrapper, and how ContextIdFactory enables durable provider subtrees at commit a3a31b9."
+---
+
+NestJS supports three provider lifetimes: `DEFAULT`, `TRANSIENT`, and `REQUEST`. The `InstanceWrapper` stores instances per context using `WeakMap<ContextId, InstancePerContext<T>>`, and `ContextIdFactory` generates the keys that identify each request or custom scope. This page explains how scopes are declared, how the framework decides whether a dependency tree is static or request-scoped, and how durable providers share subtrees across requests.
+
+## The `Scope` enum
+
+`Scope` is defined in `packages/common/interfaces/scope-options.interface.ts`:
+
+```ts packages/common/interfaces/scope-options.interface.ts
+export enum Scope {
+  DEFAULT,
+  TRANSIENT,
+  REQUEST,
+}
+```
+
+- `DEFAULT`: the provider is instantiated once at bootstrap and shared across the application.
+- `TRANSIENT`: a new instance is created for every component that injects it.
+- `REQUEST`: a new instance is created for each request processing pipeline.
+
+You set scope via `@Injectable({ scope: Scope.REQUEST })` or `@Controller({ scope: Scope.REQUEST })`.
+
+## `InstanceWrapper` per-context storage
+
+`InstanceWrapper` in `packages/core/injector/instance-wrapper.ts` stores instances in two structures depending on scope:
+
+- For `DEFAULT` and `REQUEST`: a `WeakMap<ContextId, InstancePerContext<T>>` named `values`.
+- For `TRANSIENT`: a `Map<string, WeakMap<ContextId, InstancePerContext<T>>>` named `transientMap`, keyed by `inquirerId`.
+
+```ts packages/core/injector/instance-wrapper.ts
+public getInstanceByContextId(
+  contextId: ContextId,
+  inquirerId?: string,
+): InstancePerContext<T> {
+  if (this.scope === Scope.TRANSIENT && inquirerId) {
+    return this.getInstanceByInquirerId(contextId, inquirerId);
+  }
+  const instancePerContext = this.values.get(contextId);
+  return instancePerContext
+    ? instancePerContext
+    : contextId !== STATIC_CONTEXT
+      ? this.cloneStaticInstance(contextId)
+      : {
+          instance: null as T,
+          isResolved: true,
+          isPending: false,
+        };
+}
+```
+
+When a non-static context is first accessed, `cloneStaticInstance` copies the static instance metadata but clears `instance` and `isResolved`, then creates a prototype object if the metatype is constructible.
+
+## `ContextIdFactory`
+
+`ContextIdFactory` in `packages/core/helpers/context-id-factory.ts` generates the `ContextId` objects used as `WeakMap` keys:
+
+```ts packages/core/helpers/context-id-factory.ts
+export function createContextId(): ContextId {
+  return { id: Math.random() };
+}
+```
+
+`ContextIdFactory.create()` returns a fresh object. `ContextIdFactory.getByRequest(request, propsToInspect=['raw'])` looks for an existing `ContextId` attached to the request object via the `REQUEST_CONTEXT_ID` symbol, or on `request.raw[REQUEST_CONTEXT_ID]`. If none exists and no custom strategy is registered, it creates a new one.
+
+### Durable providers and `ContextIdStrategy`
+
+A provider can be marked `durable: true` alongside `scope: Scope.REQUEST`. Durable providers share the same DI subtree across requests when the payload matches. You register a `ContextIdStrategy` with `ContextIdFactory.apply(strategy)`:
+
+```ts packages/core/helpers/context-id-factory.ts
+export interface ContextIdStrategy<T = any> {
+  attach(
+    contextId: ContextId,
+    request: T,
+  ): ContextIdResolverFn | ContextIdResolver | undefined;
+}
+```
+
+`attach` can return a `ContextIdResolver` with a `resolve` function and a `payload`. When a resolver is returned, the framework sets `contextId.getParent` to the resolver function and `contextId.payload` to the provided payload. The injector then uses `getParent` to walk up the context chain, allowing durable subtrees to be reused.
+
+## Computing `isTreeStatic` and `isTreeDurable`
+
+`InstanceWrapper` computes these flags transitively after constructor metadata is recorded:
+
+- `isDependencyTreeStatic` returns `false` if the wrapper itself is `REQUEST`-scoped, or if any dependency (constructor, property, or enhancer) has a non-static tree.
+- `isDependencyTreeDurable` returns `true` only if every non-static dependency in the tree is durable.
+
+```ts packages/core/injector/instance-wrapper.ts
+public isDependencyTreeStatic(lookupRegistry: string[] = []): boolean {
+  if (this.scope === Scope.REQUEST) {
+    this.isTreeStatic = false;
+    this.printIntrospectedAsRequestScoped();
+    return this.isTreeStatic;
+  }
+  this.isTreeStatic = !this.introspectDepsAttribute(
+    (collection, registry) =>
+      collection.some(
+        (item: InstanceWrapper) => !item.isDependencyTreeStatic(registry),
+      ),
+    lookupRegistry,
+  );
+  if (!this.isTreeStatic) {
+    this.printIntrospectedAsRequestScoped();
+  }
+  return this.isTreeStatic;
+}
+```
+
+These flags are cached and invalidated whenever dependency metadata changes via `resetDependencyTreeState`.
+
+## Request-scoped controllers
+
+When a controller is `REQUEST`-scoped, `RouterExplorer` in `packages/core/router/router-explorer.ts` does not bind the route handler directly to the instance. Instead, it creates a request-scoped handler:
+
+```ts packages/core/router/router-explorer.ts
+public createRequestScopedHandler(
+  instanceWrapper: InstanceWrapper,
+  requestMethod: RequestMethod,
+  moduleRef: Module,
+  moduleKey: string,
+  methodName: string,
+) {
+  const { instance } = instanceWrapper;
+  const collection = moduleRef.controllers;
+
+  const isTreeDurable = instanceWrapper.isDependencyTreeDurable();
+
+  return async <TRequest extends Record<any, any>, TResponse>(
+    req: TRequest,
+    res: TResponse,
+    next: () => void,
+  ) => {
+    try {
+      const contextId = this.getContextId(req, isTreeDurable);
+      const contextInstance = await this.injector.loadPerContext(
+        instance,
+        moduleRef,
+        collection,
+        contextId,
+      );
+      await this.createCallbackProxy(
+        contextInstance,
+        contextInstance[methodName],
+        methodName,
+        moduleKey,
+        requestMethod,
+        contextId,
+        instanceWrapper.id,
+      )(req, res, next);
+    } catch (err) {
+      // exception filter handling
+    }
+  };
+}
+```
+
+For every incoming request, `loadPerContext` creates a new controller instance (and its request-scoped dependency tree) keyed by the request's `ContextId`.
+
+## The `REQUEST` provider
+
+The `REQUEST` token is bound at request time by `NestContainer.registerRequestProvider(request, contextId)`. This stores the raw request object in the `InternalCoreModule`'s `REQUEST` provider under the current `ContextId`, so `@Inject(REQUEST)` resolves to the active request inside a request-scoped tree.
+
+## Transient providers and the `inquirer`
+
+A `TRANSIENT` provider gets a fresh instance per inquirer. The `transientMap` is keyed by the inquirer's `id`, so two different components injecting the same transient provider each receive their own instance. If a transient provider is injected into another transient provider, the framework tracks the root inquirer via `attachRootInquirer` to ensure the correct instance chain is created.

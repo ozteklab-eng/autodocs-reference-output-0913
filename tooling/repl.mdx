@@ -1,0 +1,309 @@
+---
+title: "NestJS REPL for Runtime Container Introspection"
+sidebarTitle: "REPL"
+description: "Learn how the NestJS REPL boots a preview application context and exposes built-in commands to inspect providers, controllers, and module trees at runtime."
+---
+
+The NestJS REPL lets you open an interactive Node.js REPL session backed by a live `NestApplicationContext` without starting an HTTP server. At this commit (`a3a31b9`), the `repl` function in `packages/core/repl/repl.ts` constructs a `ReplContext`, registers native commands, and proxies container lookups so you can inspect singletons, resolve request-scoped instances, and navigate the module tree interactively.
+
+## Booting the REPL
+
+The entry point is an async function that accepts a root module and optional Node `ReplOptions`:
+
+```ts packages/core/repl/repl.ts
+export async function repl(
+  module: Type | DynamicModule,
+  replOptions: ReplOptions = {},
+) {
+  const app = await NestFactory.createApplicationContext(module, {
+    abortOnError: false,
+    logger: new ReplLogger(),
+  });
+  await app.init();
+
+  const replContext = new ReplContext(app);
+  Logger.log(REPL_INITIALIZED_MESSAGE);
+
+  const _repl = await import('repl');
+  const replServer = _repl.start({
+    prompt: clc.green('> '),
+    ignoreUndefined: true,
+    ...replOptions,
+  });
+  assignToObject(replServer.context, replContext.globalScope);
+
+  defineDefaultCommandsOnRepl(replServer);
+
+  replServer.on('exit', async () => {
+    await app.close();
+  });
+
+  return replServer;
+}
+```
+
+Key behaviors:
+
+- It creates an application context with `abortOnError: false` so initialization errors do not crash the process.
+- It swaps in `ReplLogger`, which suppresses routine startup logs from `RoutesResolver`, `RouterExplorer`, and `NestApplication` so the prompt stays clean.
+- It eagerly imports `repl`, starts the server with a green `> ` prompt, and copies every property from `ReplContext.globalScope` into the REPL context using `assignToObject` so descriptors (including getters) are preserved.
+- On exit, it automatically calls `app.close()` to run shutdown hooks.
+
+## ReplContext and the global scope
+
+`packages/core/repl/repl-context.ts` defines `ReplContext`, which builds two data structures:
+
+1. `debugRegistry` — a map of module names to their controllers and providers.
+2. `globalScope` — an object whose properties become top-level REPL variables and functions.
+
+During construction, `ReplContext` iterates every module in `NestContainer.getModules()` and populates the scope:
+
+```ts packages/core/repl/repl-context.ts
+  private initializeContext() {
+    const modules = this.container.getModules();
+
+    modules.forEach(moduleRef => {
+      let moduleName = moduleRef.metatype.name;
+      if (moduleName === InternalCoreModule.name) {
+        return;
+      }
+      if (this.globalScope[moduleName]) {
+        moduleName += ` (${moduleRef.token})`;
+      }
+
+      this.introspectCollection(moduleRef, moduleName, 'providers');
+      this.introspectCollection(moduleRef, moduleName, 'controllers');
+
+      Object.defineProperty(this.globalScope, moduleName, {
+        value: moduleRef.metatype,
+        configurable: false,
+        enumerable: true,
+      });
+    });
+  }
+```
+
+For each provider and controller token, the context adds an enumerable property to `globalScope` so tab-completion works in the REPL. Duplicated class names are disambiguated by appending the module token. `InternalCoreModule` and `ApplicationConfig` are skipped to keep the namespace clean.
+
+## Native commands
+
+`ReplContext` initializes six built-in functions in `packages/core/repl/native-functions/`:
+
+| Command | File | Purpose |
+| --- | --- | --- |
+| `get` / `$` | `get-repl-fn.ts` | Retrieve a singleton or request-scoped instance via `app.get(token)` |
+| `resolve` | `resolve-repl-fn.ts` | Resolve a transient or request-scoped instance via `app.resolve(token, contextId?)` |
+| `select` | `select-relp-fn.ts` | Switch the active module context via `app.select(token)` |
+| `methods` | `methods-repl-fn.ts` | List public methods on a provider or controller using `MetadataScanner` |
+| `debug` | `debug-repl-fn.ts` | Print the module tree with controllers and providers |
+| `help` / `?` | `help-repl-fn.ts` | Display available commands and signatures |
+
+Each command extends `ReplFunction`, an abstract base class in `packages/core/repl/repl-function.ts`:
+
+```ts packages/core/repl/repl-function.ts
+export abstract class ReplFunction<
+  ActionParams extends Array<unknown> = Array<unknown>,
+  ActionReturn = any,
+> {
+  public abstract fnDefinition: ReplFnDefinition;
+
+  protected readonly logger: Logger;
+
+  constructor(protected readonly ctx: ReplContext) {
+    this.logger = ctx.logger;
+  }
+
+  abstract action(...args: ActionParams): ActionReturn;
+
+  public makeHelpMessage(): string {
+    const { description, name, signature } = this.fnDefinition;
+    const fnSignatureWithName = `${name}${signature}`;
+    return `${clc.yellow(description)}\n${clc.magentaBright(
+      'Interface:',
+    )} ${clc.bold(fnSignatureWithName)}\n`;
+  }
+}
+```
+
+### get and \$
+
+`get` proxies directly to the application context's `get` method:
+
+```ts packages/core/repl/native-functions/get-repl-fn.ts
+export class GetReplFn extends ReplFunction {
+  public fnDefinition: ReplFnDefinition = {
+    name: 'get',
+    signature: '(token: InjectionToken) => any',
+    description:
+      'Retrieves an instance of either injectable or controller, otherwise, throws exception.',
+    aliases: ['$'],
+  };
+
+  action(token: string | symbol | Function | Type<any>): any {
+    return this.ctx.app.get(token);
+  }
+}
+```
+
+Because the REPL shares the same `NestContainer` and `Injector` as the running context, `get` returns the actual singleton instances, not copies. The alias `$` is registered as a separate entry in `nativeFunctions` that shares the same bound `action`.
+
+### resolve
+
+`resolve` is the REPL equivalent of `ModuleRef.resolve`, which creates a new context id and instantiates request-scoped or transient providers on demand:
+
+```ts packages/core/repl/native-functions/resolve-repl-fn.ts
+export class ResolveReplFn extends ReplFunction {
+  public fnDefinition: ReplFnDefinition = {
+    name: 'resolve',
+    description:
+      'Resolves transient or request-scoped instance of either injectable or controller, otherwise, throws exception.',
+    signature: '(token: InjectionToken, contextId: any) => Promise<any>',
+  };
+
+  action(
+    token: string | symbol | Function | Type<any>,
+    contextId: any,
+  ): Promise<any> {
+    return this.ctx.app.resolve(token, contextId);
+  }
+}
+```
+
+### select
+
+`select` lets you narrow the lookup scope to a specific module, which is useful when the same token is registered in multiple modules:
+
+```ts packages/core/repl/native-functions/select-relp-fn.ts
+export class SelectReplFn extends ReplFunction {
+  public fnDefinition: ReplFnDefinition = {
+    name: 'select',
+    description:
+      'Allows navigating through the modules tree, for example, to pull out a specific instance from the selected module.',
+    signature: '(token: DynamicModule | ClassRef) => INestApplicationContext',
+  };
+
+  action(token: DynamicModule | Type<unknown>): INestApplicationContext {
+    return this.ctx.app.select(token);
+  }
+}
+```
+
+### methods
+
+`methods` uses `MetadataScanner` to list every public method name on a class prototype:
+
+```ts packages/core/repl/native-functions/methods-repl-fn.ts
+export class MethodsReplFn extends ReplFunction {
+  public fnDefinition: ReplFnDefinition = {
+    name: 'methods',
+    description:
+      'Display all public methods available on a given provider or controller.',
+    signature: '(token: ClassRef | string) => void',
+  };
+
+  private readonly metadataScanner = new MetadataScanner();
+
+  action(token: Type<unknown> | string): void {
+    const proto =
+      typeof token !== 'function'
+        ? Object.getPrototypeOf(this.ctx.app.get(token))
+        : token?.prototype;
+
+    const methods = this.metadataScanner.getAllMethodNames(proto);
+    // ... prints methods
+  }
+}
+```
+
+If you pass a string token, it first resolves the instance and then reads its prototype.
+
+### debug
+
+`debug` prints the module tree. Without arguments it prints every module; with a module class argument it prints only that module's controllers and providers:
+
+```ts packages/core/repl/native-functions/debug-repl-fn.ts
+export class DebugReplFn extends ReplFunction {
+  public fnDefinition: ReplFnDefinition = {
+    name: 'debug',
+    description:
+      'Print all registered modules as a list together with their controllers and providers.\nIf the argument is passed in, for example, "debug(MyModule)" then it will only print components of this specific module.',
+    signature: '(moduleCls?: ClassRef | string) => void',
+  };
+
+  action(moduleCls?: Type<unknown> | string): void {
+    // ... iterates debugRegistry and prints collections
+  }
+```
+
+### help
+
+`help` sorts all registered native functions by name and prints their descriptions and signatures. It also defines a `.help` getter on every command so you can run `get.help` or `resolve.help` to see usage for a single command.
+
+## Default REPL commands
+
+`packages/core/repl/repl-native-commands.ts` adds a standard `help` command to the underlying `REPLServer` that bridges Node's built-in command list with NestJS native functions:
+
+```ts packages/core/repl/repl-native-commands.ts
+export function defineDefaultCommandsOnRepl(replServer: REPLServer): void {
+  replServer.defineCommand('help', {
+    help: 'Show REPL options',
+    action(name?: string) {
+      this.clearBufferedCommand();
+      // ... lists commands, then calls this.context.help()
+    },
+  });
+}
+```
+
+When you type `.help` without an argument, the server prints Node REPL commands, then invokes the NestJS `help()` native function to list framework-specific commands.
+
+## Logging
+
+`ReplLogger` in `packages/core/repl/repl-logger.ts` extends `ConsoleLogger` and suppresses logs from three noisy contexts:
+
+```ts packages/core/repl/repl-logger.ts
+export class ReplLogger extends ConsoleLogger {
+  private static readonly ignoredContexts = [
+    RoutesResolver.name,
+    RouterExplorer.name,
+    NestApplication.name,
+  ];
+
+  log(_message: any, context?: string) {
+    if (ReplLogger.ignoredContexts.includes(context!)) {
+      return;
+    }
+    return super.log.apply(this, Array.from(arguments) as [any, string?]);
+  }
+}
+```
+
+This keeps the REPL prompt readable while still showing warnings or errors from your own application code.
+
+## Typical REPL session
+
+After starting the REPL, the module names and token names are already in scope, so you can interact directly:
+
+```text
+> get(UsersService)
+UsersService { repository: UserRepository { ... } }
+
+> methods(UsersService)
+Methods:
+  ◻ findAll
+  ◻ findOne
+  ◻ create
+
+> debug()
+AppModule:
+  - controllers:
+    ◻ UsersController
+  - providers:
+    ◻ UsersService
+    ◻ UserRepository
+
+> select(UsersModule).get(UsersService)
+UsersService { ... }
+```
+
+Because the REPL uses the same injector and container as a normal application, what you see in `get()` is exactly what the runtime sees. This makes the REPL a reliable tool for debugging dependency wiring, verifying override behavior, and inspecting enhancer bindings without writing extra test code.

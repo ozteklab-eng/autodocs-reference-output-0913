@@ -1,0 +1,146 @@
+---
+title: "NestJS ExecutionContextHost: Inspecting the Request Context"
+sidebarTitle: "Execution Context"
+description: "Understand how ExecutionContextHost implements ExecutionContext and ArgumentsHost, providing switchToHttp, switchToRpc, switchToWs, and reflection helpers for guards, interceptors, and filters."
+---
+
+NestJS passes an `ExecutionContext` to every guard, interceptor, and filter so they can inspect the current request, handler, and class. `ExecutionContextHost` in `packages/core/helpers/execution-context-host.ts` is the concrete implementation used across HTTP, RPC, and WebSocket dispatchers. This page documents its exact API, how arguments are mapped per transport, and the distinction between `ArgumentsHost` and `ExecutionContext`.
+
+## Class definition
+
+```ts packages/core/helpers/execution-context-host.ts
+import type { ExecutionContext } from '@nestjs/common';
+import type { Type, ContextType } from '@nestjs/common';
+import type {
+  HttpArgumentsHost,
+  RpcArgumentsHost,
+  WsArgumentsHost,
+} from '@nestjs/common/internal';
+
+export class ExecutionContextHost implements ExecutionContext {
+  private contextType = 'http';
+
+  constructor(
+    private readonly args: any[],
+    private readonly constructorRef: Type<any> | null = null,
+    private readonly handler: Function | null = null,
+  ) {}
+
+  setType<TContext extends string = ContextType>(type: TContext) {
+    type && (this.contextType = type);
+  }
+
+  getType<TContext extends string = ContextType>(): TContext {
+    return this.contextType as TContext;
+  }
+
+  getClass<T = any>(): Type<T> {
+    return this.constructorRef!;
+  }
+
+  getHandler(): Function {
+    return this.handler!;
+  }
+
+  getArgs<T extends Array<any> = any[]>(): T {
+    return this.args as T;
+  }
+
+  getArgByIndex<T = any>(index: number): T {
+    return this.args[index] as T;
+  }
+
+  switchToRpc(): RpcArgumentsHost {
+    return Object.assign(this, {
+      getData: () => this.getArgByIndex(0),
+      getContext: () => this.getArgByIndex(1),
+    });
+  }
+
+  switchToHttp(): HttpArgumentsHost {
+    return Object.assign(this, {
+      getRequest: () => this.getArgByIndex(0),
+      getResponse: () => this.getArgByIndex(1),
+      getNext: () => this.getArgByIndex(2),
+    });
+  }
+
+  switchToWs(): WsArgumentsHost {
+    return Object.assign(this, {
+      getClient: () => this.getArgByIndex(0),
+      getData: () => this.getArgByIndex(1),
+      getPattern: () => this.getArgByIndex(this.getArgs().length - 1),
+    });
+  }
+}
+```
+
+## ArgumentsHost vs ExecutionContext
+
+`ArgumentsHost` is the base interface. It exposes `getArgs()`, `getArgByIndex(index)`, and the three `switchTo*` methods that let you retrieve transport-specific objects without knowing the current context type at compile time.
+
+`ExecutionContext` extends `ArgumentsHost` and adds two reflection helpers:
+
+- `getClass<T>()`: returns the controller class constructor.
+- `getHandler()`: returns the method reference being invoked.
+
+These two methods are what let a guard or interceptor decide its behavior based on metadata attached to the handler or class (for example, via `Reflector.getAllAndOverride`).
+
+## How each dispatcher constructs args
+
+The args array passed to `ExecutionContextHost` depends on the transport:
+
+| Transport | args[0] | args[1] | args[2] | Additional args |
+| --- | --- | --- | --- | --- |
+| HTTP | `request` | `response` | `next` | — |
+| RPC | `data` | `context` | — | — |
+| WebSocket | `client` | `data` | ... | `pattern` at last index |
+
+In the HTTP router, the context is created with `[req, res, next]`:
+
+```ts
+const context = new ExecutionContextHost(
+  [req, res, next],
+  instance.constructor,
+  callback,
+);
+context.setType('http');
+```
+
+In RPC handlers, it is `[data, ctx]`. In WebSocket gateways, it is `[client, data, ...]` with the pattern at the final index.
+
+## Using the context in enhancers
+
+A guard can inspect the request and reflect on the handler:
+
+```ts
+@Injectable()
+class AuthGuard implements CanActivate {
+  canActivate(context: ExecutionContext): boolean {
+    const request = context.switchToHttp().getRequest();
+    const handler = context.getHandler();
+    const controller = context.getClass();
+    // Use Reflector to read metadata from handler or class
+    return true;
+  }
+}
+```
+
+An interceptor can do the same, plus transform the response stream:
+
+```ts
+@Injectable()
+class TransformInterceptor implements NestInterceptor {
+  intercept(context: ExecutionContext, next: CallHandler): Observable<any> {
+    const request = context.switchToHttp().getRequest();
+    return next.handle().pipe(map(data => ({ data })));
+  }
+}
+```
+
+## Source references
+
+- `packages/core/helpers/execution-context-host.ts` — `ExecutionContextHost`
+- `packages/core/guards/guards-consumer.ts` — `GuardsConsumer.createContext`
+- `packages/core/interceptors/interceptors-consumer.ts` — `InterceptorsConsumer.createContext`
+- `packages/core/router/router-execution-context.ts` — args array construction for HTTP

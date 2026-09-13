@@ -1,0 +1,158 @@
+---
+title: "NestJS Microservices: Transports, Servers, Clients, and Patterns"
+sidebarTitle: "Microservices"
+description: "How NestMicroservice, MicroservicesModule, transport servers, and ClientProxy implement request-response and event patterns over TCP, Redis, NATS, MQTT, gRPC, RabbitMQ, and Kafka."
+---
+
+Nest's microservices package layers a message-oriented runtime on top of the same DI container the HTTP application uses. Controllers become message and event handlers, providers become clients that publish requests, and the framework routes traffic through one of several pluggable transport strategies. This page walks through the runtime types, transport enum, decorators, and client factory.
+
+## NestMicroservice: the microservice application
+
+`NestMicroservice` in `packages/microservices/nest-microservice.ts` extends `NestApplicationContext` and implements `INestMicroservice`. It owns a single transport server and reuses the container's DI graph:
+
+```ts packages/microservices/nest-microservice.ts
+export class NestMicroservice
+  extends NestApplicationContext
+  implements INestMicroservice {
+  public async listen(): Promise<any> { /* ... */ }
+  public async close(): Promise<any> { /* ... */ }
+  public useWebSocketAdapter(adapter: WebSocketAdapter): this { /* ... */ }
+  public useGlobalFilters(...filters: ExceptionFilter[]): this { /* ... */ }
+  public useGlobalPipes(...pipes: PipeTransform[]): this { /* ... */ }
+  public useGlobalInterceptors(...interceptors: NestInterceptor[]): this { /* ... */ }
+  public useGlobalGuards(...guards: CanActivate[]): this { /* ... */ }
+}
+```
+
+You obtain one two ways:
+
+- Standalone: `NestFactory.createMicroservice(module, options)` (see [NestFactory](/bootstrap/nest-factory)).
+- Hybrid: `NestApplication.connectMicroservice(options, hybridOptions?)`, which pushes a `NestMicroservice` into an internal `microservices[]` array. `startAllMicroservices()` then calls `listen()` on each, and `close()` closes them alongside the HTTP server.
+
+## Transport enum
+
+`Transport` in `packages/microservices/enums/transport.enum.ts` enumerates the built-in strategies:
+
+```ts packages/microservices/enums/transport.enum.ts
+export enum Transport {
+  TCP,
+  REDIS,
+  NATS,
+  MQTT,
+  GRPC,
+  RMQ,
+  KAFKA,
+}
+```
+
+## Server strategies
+
+Every transport has a server implementation under `packages/microservices/server/`:
+
+- `ServerTCP` (`server-tcp.ts`)
+- `ServerRedis` (`server-redis.ts`)
+- `ServerNats` (`server-nats.ts`)
+- `ServerMqtt` (`server-mqtt.ts`)
+- `ServerGrpc` (`server-grpc.ts`)
+- `ServerRMQ` (`server-rmq.ts`)
+- `ServerKafka` (`server-kafka.ts`)
+
+They all extend the abstract base `Server` in `packages/microservices/server/server.ts`, which defines the contract:
+
+```ts packages/microservices/server/server.ts
+export abstract class Server<...> {
+  public abstract listen(callback: (...optionalParams: unknown[]) => any): any;
+  public abstract close(): any;
+  // shared: addHandler, getHandlers, handleEvent, error handling
+}
+```
+
+`server-factory.ts` in the same folder picks a strategy from a `Transport` value or a `{ strategy }` option and returns the appropriate server instance.
+
+### Custom transports
+
+For anything outside the enum, implement `CustomTransportStrategy` in `packages/microservices/interfaces/custom-transport-strategy.interface.ts`:
+
+```ts packages/microservices/interfaces/custom-transport-strategy.interface.ts
+export interface CustomTransportStrategy {
+  listen(callback: (err?: unknown, ...optionalParams: unknown[]) => void): void | Promise<void>;
+  close(): any;
+  transportId?: Transport | symbol;
+}
+```
+
+Pass `{ strategy: new MyStrategy() }` to `createMicroservice` and Nest will call `listen` at startup and `close` on shutdown.
+
+## MicroservicesModule: wiring the runtime
+
+`MicroservicesModule` in `packages/microservices/microservices-module.ts` performs the same role as `RoutesResolver` does for HTTP:
+
+```ts packages/microservices/microservices-module.ts
+export class MicroservicesModule<...> {
+  public register(container: NestContainer, config: ApplicationConfig, graphInspector: GraphInspector) { /* ... */ }
+  public setupListeners(container: NestContainer, serverInstance: Server) { /* ... */ }
+  public setupClients(container: NestContainer) { /* ... */ }
+}
+```
+
+- `register` prepares internal collections and resolvers, including the `ListenersController` and `ClientsContainer`.
+- `setupClients` iterates every module, finds providers annotated with `@Client(options)` (from `packages/microservices/decorators/client.decorator.ts`), and instantiates a `ClientProxy` via `ClientProxyFactory`.
+- `setupListeners` iterates controllers and providers, reads `PATTERN_METADATA` from each method, and calls `server.addHandler(pattern, handler, isEventHandler, extras)` on the transport server.
+
+## Handler decorators
+
+All handler decorators live in `packages/microservices/decorators/`.
+
+### Message and event patterns
+
+`MessagePattern(pattern, transport?)` in `message-pattern.decorator.ts` marks a controller method as a request-response handler and stores the pattern under `PATTERN_METADATA` (and optionally `TRANSPORT_METADATA` to scope the handler to a specific transport).
+
+`EventPattern(pattern, transport?)` in `event-pattern.decorator.ts` is the same shape but marks the handler as fire-and-forget; the underlying server will not reply.
+
+### gRPC helpers
+
+`GrpcMethod(service?, method?)`, `GrpcStreamMethod(service?, method?)`, and `GrpcStreamCall(service?, method?)` (also in `message-pattern.decorator.ts`) build a pattern from the service and method name and set metadata that `ServerGrpc` reads to bind the correct proto handler. `grpc-service.decorator.ts` handles the class-level case.
+
+### Parameter decorators
+
+`Payload(field?)` in `payload.decorator.ts` extracts the message body (optionally a nested field). `Ctx()` in `ctx.decorator.ts` exposes the transport-specific context (RMQ envelope, Kafka message metadata, gRPC call, and so on).
+
+## Client side
+
+Client code lives under `packages/microservices/client/`.
+
+- `ClientsModule.register(clients)` and `ClientsModule.registerAsync(clients)` register a list of named client providers.
+- `ClientProxyFactory.create(options)` in `client-proxy-factory.ts` returns a concrete `ClientProxy` implementation for the chosen transport: `ClientTCP`, `ClientRedis`, `ClientNats`, `ClientMqtt`, `ClientRMQ`, `ClientKafka`, or `ClientGrpcProxy`.
+- `ClientProxy` in `client-proxy.ts` exposes:
+  - `send<TResult, TInput>(pattern, data)` returning an `Observable<TResult>` for request-response messages.
+  - `emit<TResult, TInput>(pattern, data)` returning an `Observable<TResult>` for events.
+  - `connect()` and `close()` to manage the underlying transport connection.
+- `@Client(options)` in `packages/microservices/decorators/client.decorator.ts` marks a class property that will be assigned a lazy `ClientProxy` at bootstrap.
+
+## Hybrid applications
+
+`NestApplication.connectMicroservice(options, hybridOptions?)` in `packages/core/nest-application.ts` builds a `NestMicroservice` that shares the same container as the HTTP application. `startAllMicroservices()` iterates the internal array and calls `listen()`; `close()` closes both the HTTP adapter and every attached microservice. The optional `hybridOptions.inheritAppConfig` copies the HTTP app's global enhancers into the microservice.
+
+## Enhancers and exceptions
+
+Microservice handlers flow through the same enhancer machinery as HTTP: guards, interceptors, and pipes are resolved from controller-level and method-level metadata plus globals (see [Enhancers](/http/enhancers)). Exceptions are handled by `ExternalExceptionsHandler` and `RpcExceptionsHandler` in `packages/core/exceptions/`; `RpcException` from `@nestjs/common` is the RPC-safe error type.
+
+The arguments host is produced by `ExecutionContextHost.switchToRpc()`, which exposes `{ getData, getContext }` (see [Execution Context](/http/execution-context)).
+
+## Source references
+
+- `packages/microservices/nest-microservice.ts` — `NestMicroservice.listen`, `close`, global enhancer setters
+- `packages/microservices/enums/transport.enum.ts` — `Transport` enum
+- `packages/microservices/server/server.ts` — abstract `Server`, `addHandler`, `getHandlers`, `handleEvent`
+- `packages/microservices/server/server-factory.ts` — strategy selection
+- `packages/microservices/server/server-tcp.ts`, `server-redis.ts`, `server-nats.ts`, `server-mqtt.ts`, `server-grpc.ts`, `server-rmq.ts`, `server-kafka.ts` — built-in transports
+- `packages/microservices/interfaces/custom-transport-strategy.interface.ts` — `CustomTransportStrategy`
+- `packages/microservices/microservices-module.ts` — `register`, `setupClients`, `setupListeners`
+- `packages/microservices/decorators/message-pattern.decorator.ts` — `MessagePattern`, `GrpcMethod`, `GrpcStreamMethod`, `GrpcStreamCall`, `PATTERN_METADATA`
+- `packages/microservices/decorators/event-pattern.decorator.ts` — `EventPattern`
+- `packages/microservices/decorators/payload.decorator.ts` — `Payload`
+- `packages/microservices/decorators/ctx.decorator.ts` — `Ctx`
+- `packages/microservices/decorators/client.decorator.ts` — `@Client`
+- `packages/microservices/client/client-proxy.ts` — `ClientProxy.send`, `emit`, `connect`, `close`
+- `packages/microservices/client/client-proxy-factory.ts` — `ClientProxyFactory.create`
+- `packages/core/nest-application.ts` — `connectMicroservice`, `startAllMicroservices`, `close`

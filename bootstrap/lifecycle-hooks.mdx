@@ -1,0 +1,316 @@
+---
+title: "NestJS Lifecycle Hooks: Init, Bootstrap, Destroy, and Shutdown"
+sidebarTitle: "Lifecycle Hooks"
+description: "How NestJS calls onModuleInit, onApplicationBootstrap, onModuleDestroy, beforeApplicationShutdown, and onApplicationShutdown across the module hierarchy."
+---
+
+NestJS provides five lifecycle hooks that run at well-defined points between module scanning and process termination. At commit `a3a31b9`, each hook is implemented as a standalone function in `packages/core/hooks/` that iterates over providers, controllers, injectables, and middlewares within a single module, then calls the module class instance itself. The order respects the module distance hierarchy: leaves initialize before their consumers, and the opposite order is used during teardown.
+
+## Hook overview
+
+| Hook | File | When it fires |
+| --- | --- | --- |
+| `onModuleInit` | `packages/core/hooks/on-module-init.hook.ts` | After `InstanceLoader` finishes and before `registerRouterHooks()` |
+| `onApplicationBootstrap` | `packages/core/hooks/on-app-bootstrap.hook.ts` | After `callInitHook()` and before `listen()` |
+| `onModuleDestroy` | `packages/core/hooks/on-module-destroy.hook.ts` | During `close()`, after `prepareClose()` and before `beforeApplicationShutdown` |
+| `beforeApplicationShutdown` | `packages/core/hooks/before-app-shutdown.hook.ts` | During `close()`, after `onModuleDestroy` and before `dispose()` |
+| `onApplicationShutdown` | `packages/core/hooks/on-app-shutdown.hook.ts` | During `close()`, after `dispose()` |
+
+All five hooks share the same traversal pattern. The differences are the interface they check for, whether they receive a `signal` argument, and whether they use `Promise.all` or `Promise.allSettled` for parallel invocation.
+
+## Hierarchy grouping
+
+Before any hook fires, instances are grouped by their `hierarchyLevel`, a numeric property on `InstanceWrapper` that indicates how deep the class sits in the dependency tree. The grouping logic lives in `packages/core/hooks/utils/get-instances-grouped-by-hierarchy-level.ts`:
+
+```ts packages/core/hooks/utils/get-instances-grouped-by-hierarchy-level.ts
+export function getInstancesGroupedByHierarchyLevel(
+  ...collections: Array<
+    | Map<InjectionToken, InstanceWrapper>
+    | Array<[InjectionToken, InstanceWrapper]>
+  >
+): Map<number, unknown[]> {
+  const groupedByHierarchyLevel = new Map<number, unknown[]>();
+
+  for (const collection of collections) {
+    for (const [_, wrapper] of collection) {
+      if (!wrapper.isDependencyTreeStatic()) {
+        continue;
+      }
+
+      const level = wrapper.hierarchyLevel;
+      if (!groupedByHierarchyLevel.has(level)) {
+        groupedByHierarchyLevel.set(level, []);
+      }
+
+      const byHierarchyLevelGroup = groupedByHierarchyLevel.get(level);
+      if (wrapper.isTransient) {
+        const staticTransientInstances = wrapper
+          .getStaticTransientInstances()
+          .filter(i => !!i)
+          .map(i => i.instance);
+        byHierarchyLevelGroup!.push(...staticTransientInstances);
+        continue;
+      }
+
+      if (wrapper.instance) {
+        byHierarchyLevelGroup!.push(wrapper.instance);
+      }
+    }
+  }
+
+  return groupedByHierarchyLevel;
+}
+```
+
+Only instances with a static dependency tree are included. Transient wrappers contribute their static transient instances. The resulting map is keyed by `hierarchyLevel` and holds arrays of raw instances.
+
+Sorting is performed by `packages/core/hooks/utils/get-sorted-hierarchy-levels.ts`:
+
+```ts packages/core/hooks/utils/get-sorted-hierarchy-levels.ts
+export function getSortedHierarchyLevels(
+  groups: Map<number, unknown[]>,
+  order: 'ASC' | 'DESC' = 'ASC',
+): number[] {
+  const comparator =
+    order === 'ASC'
+      ? (a: number, b: number) => a - b
+      : (a: number, b: number) => b - a;
+  const levels = Array.from(groups.keys()).sort(comparator);
+  return levels;
+}
+```
+
+Init and bootstrap hooks sort in ascending order (leaves first). Destroy and shutdown hooks sort in descending order (roots first).
+
+## Module class ordering
+
+Every hook function shifts the module class instance out of the providers array before iterating, then calls it after all grouped instances have been processed. For init and bootstrap, the module class is called last. For destroy and shutdown, it is called first. This is controlled by the `shift()` call and the placement of the module class invocation at the end or beginning of the function.
+
+## `onModuleInit`
+
+```ts packages/core/hooks/on-module-init.hook.ts
+export async function callModuleInitHook(moduleRef: Module): Promise<void> {
+  const providers = moduleRef.getNonAliasProviders();
+  const [_, moduleClassHost] = providers.shift()!;
+
+  const groupedInstances = getInstancesGroupedByHierarchyLevel(
+    moduleRef.controllers,
+    moduleRef.injectables,
+    moduleRef.middlewares,
+    providers,
+  );
+
+  const levels = getSortedHierarchyLevels(groupedInstances);
+  for (const level of levels) {
+    await Promise.all(callOperator(groupedInstances.get(level)!));
+  }
+
+  const moduleClassInstance = moduleClassHost.instance;
+  if (
+    moduleClassInstance &&
+    hasOnModuleInitHook(moduleClassInstance) &&
+    moduleClassHost.isDependencyTreeStatic()
+  ) {
+    await moduleClassInstance.onModuleInit();
+  }
+}
+```
+
+Note the `isDependencyTreeStatic()` gate on the module class instance. If the module class itself depends on request-scoped providers, its `onModuleInit` is skipped because the instance may not be fully resolvable at bootstrap time.
+
+## `onApplicationBootstrap`
+
+```ts packages/core/hooks/on-app-bootstrap.hook.ts
+export async function callModuleBootstrapHook(moduleRef: Module): Promise<any> {
+  const providers = moduleRef.getNonAliasProviders();
+  const [_, moduleClassHost] = providers.shift()!;
+  const groupedInstances = getInstancesGroupedByHierarchyLevel(
+    moduleRef.controllers,
+    moduleRef.injectables,
+    moduleRef.middlewares,
+    providers,
+  );
+
+  const levels = getSortedHierarchyLevels(groupedInstances);
+  for (const level of levels) {
+    await Promise.all(callOperator(groupedInstances.get(level)!));
+  }
+
+  const moduleClassInstance = moduleClassHost.instance;
+  if (
+    moduleClassInstance &&
+    hasOnAppBootstrapHook(moduleClassInstance) &&
+    moduleClassHost.isDependencyTreeStatic()
+  ) {
+    await moduleClassInstance.onApplicationBootstrap();
+  }
+}
+```
+
+The structure is identical to `onModuleInit`, but it checks for `onApplicationBootstrap` instead.
+
+## `onModuleDestroy`
+
+```ts packages/core/hooks/on-module-destroy.hook.ts
+export async function callModuleDestroyHook(moduleRef: Module): Promise<any> {
+  const providers = moduleRef.getNonAliasProviders();
+  const [_, moduleClassHost] = providers.shift()!;
+  const groupedInstances = getInstancesGroupedByHierarchyLevel(
+    moduleRef.controllers,
+    moduleRef.injectables,
+    moduleRef.middlewares,
+    providers,
+  );
+
+  const levels = getSortedHierarchyLevels(groupedInstances, 'DESC');
+  for (const level of levels) {
+    const results = await Promise.allSettled(
+      callOperator(groupedInstances.get(level)!),
+    );
+    results
+      .filter(
+        (result): result is PromiseRejectedResult =>
+          result.status === 'rejected',
+      )
+      .forEach(result =>
+        Logger.error(result.reason, (result.reason as Error)?.stack),
+      );
+  }
+
+  const moduleClassInstance = moduleClassHost.instance;
+  if (
+    moduleClassInstance &&
+    hasOnModuleDestroyHook(moduleClassInstance) &&
+    moduleClassHost.isDependencyTreeStatic()
+  ) {
+    try {
+      await moduleClassInstance.onModuleDestroy();
+    } catch (err) {
+      Logger.error(err, (err as Error)?.stack);
+    }
+  }
+}
+```
+
+Two differences from init/bootstrap:
+
+1. Levels are sorted in `'DESC'` order so roots are destroyed before leaves.
+2. `Promise.allSettled` is used instead of `Promise.all`, and rejections are logged rather than thrown. The module class hook is also wrapped in a `try/catch`.
+
+## `beforeApplicationShutdown`
+
+```ts packages/core/hooks/before-app-shutdown.hook.ts
+export async function callBeforeAppShutdownHook(
+  moduleRef: Module,
+  signal?: string,
+): Promise<void> {
+  const providers = moduleRef.getNonAliasProviders();
+  const [_, moduleClassHost] = providers.shift()!;
+  const groupedInstances = getInstancesGroupedByHierarchyLevel(
+    moduleRef.controllers,
+    moduleRef.injectables,
+    moduleRef.middlewares,
+    providers,
+  );
+
+  const levels = getSortedHierarchyLevels(groupedInstances, 'DESC');
+  for (const level of levels) {
+    const results = await Promise.allSettled(
+      callOperator(groupedInstances.get(level)!, signal),
+    );
+    results
+      .filter(
+        (result): result is PromiseRejectedResult =>
+          result.status === 'rejected',
+      )
+      .forEach(result =>
+        Logger.error(result.reason, (result.reason as Error)?.stack),
+      );
+  }
+  const moduleClassInstance = moduleClassHost.instance;
+  if (
+    moduleClassInstance &&
+    hasBeforeApplicationShutdownHook(moduleClassInstance) &&
+    moduleClassHost.isDependencyTreeStatic()
+  ) {
+    try {
+      await moduleClassInstance.beforeApplicationShutdown(signal);
+    } catch (err) {
+      Logger.error(err, (err as Error)?.stack);
+    }
+  }
+}
+```
+
+This hook receives the shutdown `signal` (for example, `SIGTERM`) and passes it to each implementing instance. The module class is called first, consistent with the destroy pattern.
+
+## `onApplicationShutdown`
+
+```ts packages/core/hooks/on-app-shutdown.hook.ts
+export async function callAppShutdownHook(
+  moduleRef: Module,
+  signal?: string,
+): Promise<any> {
+  const providers = moduleRef.getNonAliasProviders();
+  const [_, moduleClassHost] = providers.shift()!;
+  const groupedInstances = getInstancesGroupedByHierarchyLevel(
+    moduleRef.controllers,
+    moduleRef.injectables,
+    moduleRef.middlewares,
+    providers,
+  );
+
+  const levels = getSortedHierarchyLevels(groupedInstances, 'DESC');
+  for (const level of levels) {
+    const results = await Promise.allSettled(
+      callOperator(groupedInstances.get(level)!, signal),
+    );
+    results
+      .filter(
+        (result): result is PromiseRejectedResult =>
+          result.status === 'rejected',
+      )
+      .forEach(result =>
+        Logger.error(result.reason, (result.reason as Error)?.stack),
+      );
+  }
+  const moduleClassInstance = moduleClassHost.instance;
+  if (
+    moduleClassInstance &&
+    hasOnAppShutdownHook(moduleClassInstance) &&
+    moduleClassHost.isDependencyTreeStatic()
+  ) {
+    try {
+      await moduleClassInstance.onApplicationShutdown(signal);
+    } catch (err) {
+      Logger.error(err, (err as Error)?.stack);
+    }
+  }
+}
+```
+
+This is the final hook in the shutdown sequence. It runs after the HTTP server, WebSocket servers, and microservices have been disposed.
+
+## Module distance ordering
+
+The caller in `packages/core/nest-application-context.ts` sorts modules by `distance` before invoking each hook:
+
+```ts packages/core/nest-application-context.ts
+private getModulesToTriggerHooksOn(): Module[] {
+  if (this._moduleRefsForHooksByDistance) {
+    return this._moduleRefsForHooksByDistance;
+  }
+  const modulesContainer = this.container.getModules();
+  const compareFn = (a: Module, b: Module) => b.distance - a.distance;
+  const modulesSortedByDistance = Array.from(modulesContainer.values()).sort(
+    compareFn,
+  );
+
+  this._moduleRefsForHooksByDistance = this.appOptions?.preview
+    ? modulesSortedByDistance.filter(moduleRef => moduleRef.initOnPreview)
+    : modulesSortedByDistance;
+  return this._moduleRefsForHooksByDistance;
+}
+```
+
+For init and bootstrap, the array is iterated forward (highest distance first, which means leaves first). For destroy and shutdown, the array is reversed before iteration. The result is a deterministic traversal that respects the module dependency graph.

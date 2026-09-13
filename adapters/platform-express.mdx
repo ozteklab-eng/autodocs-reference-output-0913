@@ -1,0 +1,265 @@
+---
+title: "ExpressAdapter: NestJS Express Platform Implementation"
+sidebarTitle: "Platform Express"
+description: "How ExpressAdapter implements the AbstractHttpAdapter contract for Express, covering verb routing, middleware, body parsing, view engines, and route order sensitivity."
+---
+
+`ExpressAdapter` is the concrete implementation of `AbstractHttpAdapter` for Express.js. At commit `a3a31b9`, the full implementation lives in `packages/platform-express/adapters/express-adapter.ts`. It wraps an Express application instance and translates every Nest HTTP operation into the corresponding Express API call.
+
+## Creating the Express instance
+
+The adapter creates an Express application if none is supplied:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+  constructor(instance?: any) {
+    super(instance || express());
+    this.instance!.use((req, res, next) => {
+      if (this.onResponseHook) {
+        res.on('finish', () => {
+          void this.onResponseHook!.apply(this, [req, res]);
+        });
+      }
+
+      if (this.onRequestHook) {
+        void this.onRequestHook.apply(this, [req, res, next]);
+      } else {
+        next();
+      }
+    });
+  }
+```
+
+This top-level middleware installs hooks for request and response lifecycle events that Nest uses internally.
+
+## HTTP verb routing
+
+Each verb method delegates directly to the Express app:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+  public get(...args: any[]) {
+    return this.instance.get(...args);
+  }
+```
+
+The same delegation pattern applies to `post`, `put`, `delete`, `patch`, `head`, `options`, `all`, `search`, `propfind`, `proppatch`, `mkcol`, `copy`, `move`, `lock`, and `unlock`. Nest does not transform the path here; it relies on Express to match routes in declaration order.
+
+## Middleware support
+
+Express-style middleware is supported natively through `use`:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+  public use(...args: any[]) {
+    return this.instance.use(...args);
+  }
+```
+
+When `MiddlewareModule` calls `createMiddlewareFactory`, the adapter returns a function that uses `RouterMethodFactory` to map the Nest `RequestMethod` enum to the correct Express router method:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+  public createMiddlewareFactory(
+    requestMethod: RequestMethod,
+  ): (path: string, callback: Function) => any {
+    return (path: string, callback: Function) => {
+      try {
+        const convertedPath = LegacyRouteConverter.tryConvert(path);
+        return this.routerMethodFactory
+          .get(this.instance, requestMethod)
+          .call(this.instance, convertedPath, callback);
+      } catch (e) {
+        if (e instanceof TypeError) {
+          LegacyRouteConverter.printError(path);
+        }
+        throw e;
+      }
+    };
+  }
+```
+
+## Response helpers
+
+`reply` handles the most common response shapes Nest produces:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+  public reply(response: any, body: any, statusCode?: number) {
+    if (!isNil(statusCode)) {
+      response.status(statusCode);
+    }
+    if (isNil(body)) {
+      return response.send();
+    }
+    if (body instanceof StreamableFile) {
+      this.applyStreamHeaders(response, body);
+      const stream = body.getStream();
+      stream.once('error', err => {
+        body.errorHandler(err, response);
+      });
+      return stream
+        .pipe<Writable>(response)
+        .on('error', (err: Error) => body.errorLogger(err));
+    }
+    const responseContentType = response.getHeader('Content-Type');
+    if (
+      typeof responseContentType === 'string' &&
+      !responseContentType.startsWith('application/json') &&
+      body?.statusCode >= HttpStatus.BAD_REQUEST
+    ) {
+      this.logger.warn(
+        "Content-Type doesn't match Reply body, you might need a custom ExceptionFilter for non-JSON responses",
+      );
+      response.setHeader('Content-Type', 'application/json');
+    }
+    return isObject(body) ? response.json(body) : response.send(String(body));
+  }
+```
+
+Strings and buffers are sent with `response.send`, objects with `response.json`, and `StreamableFile` instances are piped directly to the response stream.
+
+## View engine and static assets
+
+Express template rendering is exposed through thin wrappers:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+  public render(response: any, view: string, options: any) {
+    return response.render(view, options);
+  }
+
+  public setViewEngine(engine: string) {
+    return this.set('view engine', engine);
+  }
+
+  public setBaseViewsDir(path: string | string[]) {
+    return this.set('views', path);
+  }
+
+  public useStaticAssets(path: string, options: ServeStaticOptions) {
+    if (options && options.prefix) {
+      return this.use(options.prefix, express.static(path, options));
+    }
+    return this.use(express.static(path, options));
+  }
+```
+
+`setViewEngine` maps to Express's `app.set('view engine', ...)`, while `useStaticAssets` mounts `express.static` either at the root or under a prefix.
+
+## Body parsing
+
+`registerParserMiddleware` installs `body-parser` middleware (or Express 5 built-in equivalents) for JSON and URL-encoded bodies:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+  public registerParserMiddleware(prefix?: string, rawBody?: boolean) {
+    const bodyParserJsonOptions = getBodyParserOptions('json', rawBody!);
+    const bodyParserUrlencodedOptions = getBodyParserOptions(
+      'urlencoded',
+      rawBody!,
+      { extended: true },
+    );
+
+    const parserMiddleware = {
+      jsonParser: express.json(bodyParserJsonOptions),
+      urlencodedParser: express.urlencoded(bodyParserUrlencodedOptions),
+    };
+    Object.keys(parserMiddleware)
+      .filter(parser => !this.isMiddlewareApplied(parser))
+      .forEach(parserKey => this.use(parserMiddleware[parserKey]));
+  }
+```
+
+The adapter also exposes `useBodyParser` for registering parsers on demand with type-safe options:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+  public useBodyParser<ParserType extends NestExpressBodyParserType>(
+    type: ParserType,
+    rawBody: boolean,
+    options?: NestExpressBodyParserOptionsFor<ParserType>,
+  ): this {
+    const parserOptions = getBodyParserOptions(type, rawBody, options);
+    const parser = express[type](parserOptions);
+    this.use(parser);
+    return this;
+  }
+```
+
+## Server initialization
+
+`initHttpServer` creates the actual Node.js server:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+  public initHttpServer(options: NestApplicationOptions) {
+    const isHttpsEnabled = options && options.httpsOptions;
+    if (isHttpsEnabled) {
+      this.httpServer = https.createServer(
+        options.httpsOptions!,
+        this.getInstance(),
+      );
+    } else {
+      this.httpServer = http.createServer(this.getInstance());
+    }
+
+    if (options?.return503OnClosing) {
+      this.instance.use((req: any, res: any, next: any) => {
+        if (this.isShuttingDown) {
+          res.set('Connection', 'close');
+          res.status(503).send('Service Unavailable');
+        } else {
+          next();
+        }
+      });
+    }
+
+    if (options?.forceCloseConnections) {
+      this.trackOpenConnections();
+    }
+  }
+```
+
+If `httpsOptions` is provided, it creates an `https.Server`; otherwise it creates an `http.Server`. The adapter also supports graceful shutdown signals (`return503OnClosing` and `forceCloseConnections`) by tracking open sockets and returning 503 during shutdown.
+
+## Route order sensitivity
+
+Express matches routes in the order they are declared. The adapter signals this to Nest core:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+  public isRouteOrderSensitive(): boolean {
+    return true;
+  }
+```
+
+Because this returns `true`, `NestApplication.registerRouter` in `packages/core/nest-application.ts` (around line 219) sorts routes by specificity when the resolution strategy is set to `'specificity'`. More specific routes are registered first so they are matched before broader wildcard patterns.
+
+## Platform-specific helpers
+
+`NestExpressApplication` (declared in `packages/platform-express/interfaces/nest-express-application.interface.ts`) exposes additional methods that are only available when you type the app as `NestExpressApplication`:
+
+```ts packages/platform-express/interfaces/nest-express-application.interface.ts
+  set(...args: any[]): this;
+  engine(...args: any[]): this;
+  enable(...args: any[]): this;
+  disable(...args: any[]): this;
+  useStaticAssets(path: string, options?: ServeStaticOptions): this;
+  setBaseViewsDir(path: string | string[]): this;
+  setViewEngine(engine: string): this;
+  useBodyParser<ParserType extends NestExpressBodyParserType>(
+    parser: ParserType,
+    options?: NestExpressBodyParserOptionsFor<ParserType>,
+  ): this;
+  setLocal(key: string, value: any): this;
+```
+
+These are thin wrappers around native Express methods such as `app.set`, `app.engine`, and `app.locals`.
+
+## Exception mapping
+
+The adapter maps certain native Express errors to Nest `BadRequestException` instances:
+
+```ts packages/platform-express/adapters/express-adapter.ts
+  public mapException(error: unknown): unknown {
+    switch (true) {
+      case error instanceof SyntaxError || error instanceof URIError:
+        return new BadRequestException(error.message);
+      default:
+        return error;
+    }
+  }
+```
+
+This ensures that invalid JSON payloads from body-parser and malformed URI sequences are surfaced as proper HTTP 400 responses through Nest's exception filter pipeline.

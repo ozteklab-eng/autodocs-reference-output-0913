@@ -1,0 +1,190 @@
+---
+title: "NestJS Injector: Resolving Dependencies and Instances"
+sidebarTitle: "Injector"
+description: "How the NestJS Injector resolves constructor parameters, detects circular dependencies with SettlementSignal, and orchestrates the two-phase instance creation at commit a3a31b9."
+---
+
+The `Injector` in `packages/core/injector/injector.ts` is the engine that turns metadata and `InstanceWrapper` placeholders into real class instances. It reads constructor design types, resolves each dependency recursively, handles async providers, and raises `CircularDependencyException` when a cycle is detected. This page walks through the core resolution methods and the two-phase orchestration performed by `InstanceLoader`.
+
+## `loadInstance`: the top-level entry point
+
+`loadInstance` is called for every provider, injectable, and controller during bootstrap. It first checks whether the target `InstancePerContext` is already pending for the current `contextId` and `inquirerId`:
+
+```ts packages/core/injector/injector.ts
+const inquirerId = this.getContextInquirerId(resolutionContext);
+const instanceHost = wrapper.getInstanceByContextId(
+  this.getContextId(resolutionContext.contextId, wrapper),
+  inquirerId,
+);
+
+if (instanceHost.isPending) {
+  const settlementSignal = wrapper.settlementSignal;
+  if (
+    resolutionContext.inquirer &&
+    settlementSignal?.isCycle(resolutionContext.inquirer.id)
+  ) {
+    throw new CircularDependencyException(`"${wrapper.name}"`);
+  }
+
+  return instanceHost.donePromise!.then((err?: unknown) => {
+    if (err) {
+      throw err;
+    }
+  });
+}
+```
+
+If the wrapper is already being resolved in the same context, the method defers to `donePromise`. If the inquirer is part of a cycle recorded in the `SettlementSignal`, it throws immediately.
+
+Otherwise, it applies a fresh `SettlementSignal`, marks the host as pending, and proceeds to resolve constructor parameters.
+
+## Two-phase orchestration: `InstanceLoader`
+
+`InstanceLoader.createInstancesOfDependencies` in `packages/core/injector/instance-loader.ts` runs two passes over every module:
+
+```ts packages/core/injector/instance-loader.ts
+public async createInstancesOfDependencies(
+  modules: Map<string, Module> = this.container.getModules(),
+) {
+  this.createPrototypes(modules);
+
+  try {
+    await this.createInstances(modules);
+  } catch (err) {
+    this.graphInspector.inspectModules(modules);
+    this.graphInspector.registerPartial(err);
+    throw err;
+  }
+  this.graphInspector.inspectModules(modules);
+}
+```
+
+### Phase 1: `createPrototypes`
+
+`createPrototypes` calls `injector.loadPrototype(wrapper, collection)` for every provider, injectable, and controller. `loadPrototype` creates an object from the class prototype and stores it back into the collection:
+
+```ts packages/core/injector/injector.ts
+public loadPrototype<T>(
+  { token }: InstanceWrapper<T>,
+  collection: Map<InjectionToken, InstanceWrapper<T>>,
+  contextId = STATIC_CONTEXT,
+) {
+  if (!collection) {
+    return;
+  }
+  const target = collection.get(token)!;
+  const instance = target.createPrototype(contextId);
+  if (instance) {
+    const wrapper = new InstanceWrapper({
+      ...target,
+      instance,
+    });
+    collection.set(token, wrapper);
+  }
+}
+```
+
+This reserves a slot so that forward-reference or circular-dependency chains can already hold a prototype object before the constructor runs.
+
+### Phase 2: `createInstances`
+
+`createInstances` resolves each category in order per module:
+
+1. Providers
+2. Injectables
+3. Controllers
+
+Each category is resolved with `Promise.all`, so independent providers within the same module are created concurrently.
+
+## Resolving constructor parameters
+
+`resolveConstructorParams` in `packages/core/injector/injector.ts` is where the bulk of dependency resolution happens. It first checks whether the wrapper has dense constructor metadata cached (used for request-scoped trees). If not, it falls back to reflection:
+
+```ts packages/core/injector/injector.ts
+const isFactoryProvider = !isNil(inject);
+const [dependencies, optionalDependenciesIds] = isFactoryProvider
+  ? this.getFactoryProviderDependencies(wrapper)
+  : this.getClassDependencies(wrapper);
+```
+
+### Reflection helpers
+
+- `reflectConstructorParams(type)` reads `Reflect.getMetadata(PARAMTYPES_METADATA, type)` and overlays `SELF_DECLARED_DEPS_METADATA` for `@Inject()` overrides.
+- `reflectOptionalParams(type)` reads `OPTIONAL_DEPS_METADATA`.
+- `reflectSelfParams(type)` reads `SELF_DECLARED_DEPS_METADATA`.
+
+For factory providers, `getFactoryProviderDependencies` maps the `inject` array, handling `OptionalFactoryDependency` objects and collecting optional indices.
+
+### Per-parameter resolution
+
+Each parameter is resolved concurrently via `resolveParam`. The method uses a `Barrier` to ensure all parameters finish before the callback is invoked. For each parameter:
+
+1. `resolveSingleParam` validates the token is not `undefined`.
+2. `resolveParamToken` unwraps `forwardRef`.
+3. `resolveComponentWrapper` starts the lookup in the current module's providers.
+4. `lookupComponent` searches the local providers; if not found, it delegates to `lookupComponentInParentModules`, which recursively walks imports.
+
+If the dependency is optional and resolution fails, `undefined` is returned instead of throwing.
+
+## `resolveComponentHost` and async providers
+
+Once the `InstanceWrapper` for a dependency is found, `resolveComponentHost` checks whether it is already resolved. If not, it calls `loadProvider` to instantiate it. After resolution, if `wrapper.async` is true, the instance is awaited:
+
+```ts packages/core/injector/injector.ts
+if (instanceWrapper.async) {
+  const host = instanceWrapper.getInstanceByContextId(
+    this.getContextId(resolutionContext.contextId, instanceWrapper),
+    inquirerId,
+  );
+  host.instance = await host.instance;
+  instanceWrapper.setInstanceByContextId(
+    resolutionContext.contextId,
+    host,
+    inquirerId,
+  );
+}
+```
+
+This is how factory providers that return a `Promise` are handled.
+
+## Circular dependency detection with `SettlementSignal`
+
+`SettlementSignal` in `packages/core/injector/settlement-signal.ts` tracks whether a wrapper is mid-resolution and which other wrappers depend on it:
+
+```ts packages/core/injector/settlement-signal.ts
+export class SettlementSignal {
+  private readonly _refs = new Set();
+  private readonly settledPromise: Promise<unknown>;
+  private settleFn!: (err?: unknown) => void;
+  private completed = false;
+
+  public insertRef(wrapperId: string) {
+    this._refs.add(wrapperId);
+  }
+
+  public isCycle(wrapperId: string) {
+    return !this.completed && this._refs.has(wrapperId);
+  }
+}
+```
+
+When `loadInstance` begins resolving a wrapper, it calls `applySettlementSignal`, which sets `isPending = true` and stores `donePromise`. If another resolution path re-enters the same wrapper before `settlementSignal.complete()` is called, `isCycle` returns true and `CircularDependencyException` is thrown.
+
+## Instantiation
+
+After all constructor parameters are resolved, the callback passed to `resolveConstructorParams` is invoked. It:
+
+1. Resolves property-based dependencies via `resolveProperties`.
+2. Calls `instantiateClass`, which either runs `new Metatype(...instances)` or invokes the factory function.
+3. Applies properties with `applyProperties`.
+4. Calls `settlementSignal.complete()`.
+
+For forward references, `instantiateClass` uses `Object.assign` to merge the new instance into the previously created prototype.
+
+## Lookup across module boundaries
+
+`lookupComponentInImports` in `packages/core/injector/injector.ts` walks the import graph. It only recurses into child modules when the current module explicitly exports the target token (`isTraversing` becomes true after the first level). This prevents accidental resolution of unexported providers. It stops at the first direct export match to avoid a later global import shadowing an explicit `forFeature` import.
+
+## Skipping static bootstrap for scoped providers
+
+`shouldSkipProviderLoading` prevents `loadProvider` from instantiating `TRANSIENT` or `REQUEST`-scoped providers during the static bootstrap phase when there is no inquirer and the context is `STATIC_CONTEXT`. These providers are created later, on demand, when a request or another scoped component asks for them.

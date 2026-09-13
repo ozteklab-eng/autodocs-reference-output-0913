@@ -1,0 +1,339 @@
+---
+title: "FastifyAdapter: NestJS Fastify Platform Implementation"
+sidebarTitle: "Platform Fastify"
+description: "How FastifyAdapter implements the AbstractHttpAdapter contract for Fastify, covering route registration, middleware bridging, plugin support, body parsing, and route order insensitivity."
+---
+
+`FastifyAdapter` is the concrete implementation of `AbstractHttpAdapter` for Fastify. At commit `a3a31b9`, the full implementation lives in `packages/platform-fastify/adapters/fastify-adapter.ts`. It wraps a `FastifyInstance` and translates Nest HTTP operations into Fastify's route and plugin model.
+
+## Creating the Fastify instance
+
+The adapter either accepts an existing `FastifyInstance` or creates one with a custom `version` constraint:
+
+```ts packages/platform-fastify/adapters/fastify-adapter.ts
+  constructor(
+    instanceOrOptions?:
+      | TInstance
+      | FastifyHttp2Options<any>
+      | FastifyHttp2SecureOptions<any>
+      | FastifyHttpsOptions<any>
+      | FastifyHttpOptions<any>
+      | FastifyAdapterBaseOptions<TServer>,
+  ) {
+    super();
+
+    const instance =
+      instanceOrOptions && (instanceOrOptions as TInstance).server
+        ? instanceOrOptions
+        : fastify({
+            ...(instanceOrOptions as FastifyServerOptions),
+            routerOptions: {
+              ...(instanceOrOptions as FastifyServerOptions)?.routerOptions,
+              constraints: {
+                version: this.versionConstraint as any,
+              },
+            },
+          });
+
+    this.setInstance(instance);
+```
+
+If the first argument already has a `server` property, it is treated as an existing instance. Otherwise, the adapter constructs a new Fastify instance and injects a `version` constraint into `routerOptions`. This constraint is used later by `applyVersionFilter` to let Fastify's router select the right handler based on version metadata.
+
+## HTTP verb routing
+
+Each verb method delegates to an internal `injectRouteOptions` helper that wraps Fastify's `instance.route`:
+
+```ts packages/platform-fastify/adapters/fastify-adapter.ts
+  public get(...args: any[]) {
+    return this.injectRouteOptions('GET', ...args);
+  }
+```
+
+The same pattern applies to `post`, `put`, `delete`, `patch`, `head`, `options`, `search`, `query`, `propfind`, `proppatch`, `mkcol`, `copy`, `move`, `lock`, and `unlock`.
+
+Inside `injectRouteOptions`, the adapter reads optional metadata keys for route config, constraints, and schema, then assembles a `RouteOptions` object:
+
+```ts packages/platform-fastify/adapters/fastify-adapter.ts
+    const routeToInject: RouteOptions<TServer, TRawRequest, TRawResponse> &
+      RouteShorthandOptions = {
+      method: routerMethodKey,
+      url: args[0],
+      handler: handlerRef,
+    };
+```
+
+If the handler carries a version (from `applyVersionFilter`), the adapter adds a `constraints.version` field so Fastify's router can dispatch correctly.
+
+## Middleware bridging
+
+Fastify does not support Express-style middleware out of the box. The adapter bridges this gap through the `@fastify/middie` plugin:
+
+```ts packages/platform-fastify/adapters/fastify-adapter.ts
+  public use(...args: any[]) {
+    if (!this.isMiddieRegistered) {
+      this.pendingMiddlewares.push({ args });
+      return this;
+    }
+    return (this.instance.use as any)(...args);
+  }
+```
+
+If `middie` is not yet registered, `use` queues the middleware. During `init()`, the adapter registers `middie` and replays the queue:
+
+```ts packages/platform-fastify/adapters/fastify-adapter.ts
+  public async init() {
+    if (this.isMiddieRegistered) {
+      return;
+    }
+    await this.registerMiddie();
+
+    if (this.pendingMiddlewares.length > 0) {
+      for (const { args } of this.pendingMiddlewares) {
+        (this.instance.use as any)(...args);
+      }
+      this.pendingMiddlewares = [];
+    }
+  }
+```
+
+`createMiddlewareFactory` (used by `MiddlewareModule`) builds a path-matching wrapper around `instance.use`:
+
+```ts packages/platform-fastify/adapters/fastify-adapter.ts
+  public async createMiddlewareFactory(
+    requestMethod: RequestMethod,
+  ): Promise<(path: string, callback: Function) => any> {
+    if (!this.isMiddieRegistered) {
+      await this.registerMiddie();
+    }
+    return (path: string, callback: Function) => {
+      // ... path normalization and regex matching via pathToRegexp
+      this.instance.use(
+        normalizedPath,
+        (req: any, res: any, next: Function) => {
+          // ... match pathname against regex, then invoke callback
+          return callback(req, res, next);
+        },
+      );
+    };
+  }
+```
+
+## Plugin and injection support
+
+The adapter exposes Fastify's plugin system directly:
+
+```ts packages/platform-fastify/adapters/fastify-adapter.ts
+  public register<
+    TRegister extends Parameters<
+      FastifyRegister<FastifyInstance<TServer, TRawRequest, TRawResponse>>
+    >,
+  >(plugin: TRegister['0'], opts?: TRegister['1']) {
+    return (this.instance.register as any)(plugin, opts);
+  }
+```
+
+This is the method you call when you want to register a Fastify plugin such as `@fastify/cors` or `@fastify/static`.
+
+For in-process testing, the adapter exposes `inject`:
+
+```ts packages/platform-fastify/adapters/fastify-adapter.ts
+  public inject(
+    opts?: InjectOptions | string,
+  ): LightMyRequestChain | Promise<LightMyRequestResponse> {
+    return this.instance.inject(opts!);
+  }
+```
+
+This delegates to Fastify's built-in `light-my-request` injection helper.
+
+## Static assets and view engine
+
+Static file serving and template rendering are implemented by registering the corresponding Fastify plugins:
+
+```ts packages/platform-fastify/adapters/fastify-adapter.ts
+  public async useStaticAssets(options: FastifyStaticOptions) {
+    return this.register(
+      await loadPackage(
+        '@fastify/static',
+        'FastifyAdapter.useStaticAssets()',
+        () => import('@fastify/static'),
+      ),
+      options,
+    );
+  }
+
+  public async setViewEngine(options: FastifyViewOptions | string) {
+    if (isString(options)) {
+      new Logger('FastifyAdapter').error(
+        "setViewEngine() doesn't support a string argument.",
+      );
+      process.exit(1);
+    }
+    return this.register(
+      await loadPackage(
+        '@fastify/view',
+        'FastifyAdapter.setViewEngine()',
+        () => import('@fastify/view'),
+      ),
+      options,
+    );
+  }
+```
+
+Note that `setViewEngine` does not accept a plain string; it requires a `FastifyViewOptions` object.
+
+## Body parsing
+
+The adapter registers custom content-type parsers instead of middleware:
+
+```ts packages/platform-fastify/adapters/fastify-adapter.ts
+  public registerParserMiddleware(prefix?: string, rawBody?: boolean) {
+    if (this._isParserRegistered) {
+      return;
+    }
+
+    this.registerUrlencodedContentParser(rawBody);
+    this.registerJsonContentParser(rawBody);
+
+    this._isParserRegistered = true;
+  }
+```
+
+JSON parsing delegates to Fastify's default JSON parser, while URL-encoded parsing uses `fast-querystring`:
+
+```ts packages/platform-fastify/adapters/fastify-adapter.ts
+  private registerJsonContentParser(rawBody?: boolean) {
+    this.useBodyParser(
+      'application/json',
+      !!rawBody,
+      { bodyLimit },
+      (req, body, done) => {
+        const defaultJsonParser = this.instance.getDefaultJsonParser(
+          onProtoPoisoning || 'error',
+          onConstructorPoisoning || 'error',
+        ) as FastifyBodyParser<string | Buffer, TServer>;
+        defaultJsonParser(req, body, done);
+      },
+    );
+  }
+
+  private registerUrlencodedContentParser(rawBody?: boolean) {
+    this.useBodyParser(
+      'application/x-www-form-urlencoded',
+      !!rawBody,
+      { bodyLimit },
+      (_req, body, done) => {
+        done(null, querystringParse(body.toString()));
+      },
+    );
+  }
+```
+
+The public `useBodyParser` method lets you register additional parsers on demand, and it respects the `rawBody` option by attaching the raw buffer to `req.rawBody`.
+
+## Hook lifecycle
+
+The adapter installs `onRequest` and `onResponse` hooks during construction so Nest can run its own request and response hooks:
+
+```ts packages/platform-fastify/adapters/fastify-adapter.ts
+    this.instance.addHook('onRequest', (request, reply, done) => {
+      if (this.onRequestHook) {
+        this.onRequestHook(request as TRequest, reply as TReply, done);
+      } else {
+        done();
+      }
+    });
+
+    this.instance.addHook('onResponse', (request, reply, done) => {
+      if (this.onResponseHook) {
+        this.onResponseHook(request as TRequest, reply as TReply, done);
+      } else {
+        done();
+      }
+    });
+```
+
+These correspond to the hooks Nest sets via `setOnRequestHook` and `setOnResponseHook`. Fastify's full hook chain (`onRequest`, `preParsing`, `preValidation`, `preHandler`, `preSerialization`, `onSend`, `onResponse`) is available on the underlying instance if you need deeper integration.
+
+## Route order insensitivity
+
+Fastify uses a radix tree for routing, so declaration order does not matter for matching. The adapter signals this to Nest core:
+
+```ts packages/platform-fastify/adapters/fastify-adapter.ts
+  public isRouteOrderSensitive(): boolean {
+    return false;
+  }
+```
+
+Because this returns `false`, `NestApplication.registerRouter` in `packages/core/nest-application.ts` (around line 219) treats the adapter as also rejecting duplicate `(method, url)` pairs synchronously:
+
+```ts packages/core/nest-application.ts
+    const adapterIsOrderSensitive =
+      this.httpAdapter.isRouteOrderSensitive?.() ?? true;
+    const adapterRejectsDuplicates = !adapterIsOrderSensitive;
+```
+
+When `adapterRejectsDuplicates` is `true`, Nest defers all route registration, detects conflicts in memory, and drops shadowed duplicates before calling `instance.route()`. This prevents Fastify from throwing a synchronous error on duplicate routes.
+
+## Server initialization
+
+Unlike Express, Fastify already owns its server. The adapter simply captures it:
+
+```ts packages/platform-fastify/adapters/fastify-adapter.ts
+  public initHttpServer() {
+    this.httpServer = this.instance.server;
+  }
+```
+
+The actual `http.Server` or `https.Server` (or `http2.Http2Server`) is created by Fastify during its own initialization, respecting any `https` or `http2` options passed in the constructor.
+
+## Platform-specific helpers
+
+`NestFastifyApplication` (declared in `packages/platform-fastify/interfaces/nest-fastify-application.interface.ts`) exposes additional methods only available when you type the app as `NestFastifyApplication`:
+
+```ts packages/platform-fastify/interfaces/nest-fastify-application.interface.ts
+  register<Options extends FastifyPluginOptions = any>(
+    plugin: FastifyPluginCallback<Options> | FastifyPluginAsync<Options> | Promise<{ default: FastifyPluginCallback<Options> }> | Promise<{ default: FastifyPluginAsync<Options> }>,
+    opts?: FastifyRegisterOptions<Options>,
+  ): Promise<FastifyInstance>;
+
+  useBodyParser<TServer extends RawServerBase = RawServerBase>(
+    type: string | string[] | RegExp,
+    options?: NestFastifyBodyParserOptions,
+    parser?: FastifyBodyParser<Buffer, TServer>,
+  ): this;
+
+  useStaticAssets(options: FastifyStaticOptions): this;
+  enableCors(options?: FastifyCorsOptions): void;
+  setViewEngine(options: FastifyViewOptions | string): this;
+  inject(): LightMyRequestChain;
+  inject(opts: InjectOptions | string): Promise<LightMyRequestResponse>;
+```
+
+These methods give you direct access to Fastify's plugin ecosystem, custom content parsers, and the `light-my-request` testing utility without leaving the Nest application context.
+
+## Exception mapping
+
+The adapter maps Fastify-specific errors back to Nest `HttpException` instances:
+
+```ts packages/platform-fastify/adapters/fastify-adapter.ts
+  public mapException(error: unknown): unknown {
+    if (this.isHttpFastifyError(error)) {
+      return new HttpException(error.message, error.statusCode);
+    }
+    return error;
+  }
+
+  private isHttpFastifyError(
+    error: any,
+  ): error is Error & { statusCode: number } {
+    return (
+      error.statusCode !== undefined &&
+      error instanceof Error &&
+      error.name === 'FastifyError'
+    );
+  }
+```
+
+This ensures that validation and serialization errors raised by Fastify are surfaced through Nest's exception filter pipeline with the correct status code.

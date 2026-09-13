@@ -1,0 +1,197 @@
+---
+title: "NestJS Routing: How Controllers and Routes Are Discovered and Bound"
+sidebarTitle: "Routing"
+description: "Learn how NestJS resolves controller paths, HTTP verb decorators, versioning, route conflicts, and request-scoped handlers through RoutesResolver, RouterExplorer, and RoutePathFactory."
+---
+
+NestJS discovers and registers HTTP routes by scanning controllers, reading metadata, and binding composed handlers to the underlying adapter. This page covers the resolver pipeline, the decorators that define paths and methods, versioning composition, and runtime conflict handling.
+
+## Route resolution overview
+
+`RoutesResolver.resolve(applicationRef, basePath)` in `packages/core/router/routes-resolver.ts` iterates every module in `NestContainer.getModules()` and calls `registerRouters(controllers, moduleName, globalPrefix, modulePath, applicationRef, options)` for each one.
+
+Inside `registerRouters`, the resolver:
+
+1. Reads `HOST_METADATA` and `VERSION_METADATA` from the controller.
+2. Calls `routerExplorer.extractRouterPath(metatype)` to get the controller prefix.
+3. Builds the path via `RoutePathFactory.create`.
+4. Calls `routerExplorer.explore(...)` to scan method-level decorators and bind handlers.
+
+```ts packages/core/router/routes-resolver.ts
+public resolve<T extends HttpServer>(
+  applicationRef: T,
+  globalPrefix: string,
+  options: RouteResolutionOptions = {},
+) {
+  const modules = this.container.getModules();
+  modules.forEach(({ controllers, metatype }, moduleName) => {
+    const modulePath = this.getModulePathMetadata(metatype)!;
+    this.registerRouters(
+      controllers, moduleName, globalPrefix, modulePath,
+      applicationRef, options,
+    );
+  });
+}
+```
+
+## Controller and method metadata
+
+`@Controller(prefixOrOptions)` in `packages/common/decorators/core/controller.decorator.ts` stores metadata via Reflect:
+
+- `PATH_METADATA`: the route prefix (string or array).
+- `HOST_METADATA`: optional host filter (string, RegExp, or array).
+- `VERSION_METADATA`: optional version value.
+- `SCOPE_OPTIONS_METADATA`: scope and durability settings.
+
+HTTP verb decorators in `packages/common/decorators/http/request-mapping.decorator.ts` set `PATH_METADATA` and `METHOD_METADATA` on the method descriptor. Supported decorators include:
+
+- Standard verbs: `Get`, `Post`, `Put`, `Delete`, `Patch`, `Options`, `Head`, `All`, `Search`, `QueryMethod`
+- WebDAV verbs: `Propfind`, `Proppatch`, `Mkcol`, `Copy`, `Move`, `Lock`, `Unlock`
+
+The numeric values come from `RequestMethod` in `packages/common/enums/request-method.enum.ts`:
+
+```ts packages/common/enums/request-method.enum.ts
+export enum RequestMethod {
+  GET = 0,
+  POST,
+  PUT,
+  DELETE,
+  PATCH,
+  ALL,
+  OPTIONS,
+  HEAD,
+  SEARCH,
+  PROPFIND,
+  PROPPATCH,
+  MKCOL,
+  COPY,
+  MOVE,
+  LOCK,
+  UNLOCK,
+  QUERY,
+}
+```
+
+## RouterExplorer: scanning and binding
+
+`RouterExplorer.explore` in `packages/core/router/router-explorer.ts` scans the controller instance for method-level route definitions via `PathsExplorer.scanForPaths`. It then calls `applyPathsToRouterProxy`, which for each route:
+
+1. Resolves the HTTP adapter method (e.g., `get`, `post`) via `RouterMethodFactory`.
+2. Decides whether the controller is request-scoped (`!instanceWrapper.isDependencyTreeStatic()`).
+3. If static, creates a callback proxy via `createCallbackProxy`.
+4. If request-scoped, creates a per-request handler via `createRequestScopedHandler`.
+5. Applies host filtering and non-URI versioning filters.
+6. Registers the final handler on the adapter.
+
+```ts packages/core/router/router-explorer.ts
+public explore<T extends HttpServer = any>(
+  instanceWrapper: InstanceWrapper,
+  moduleKey: string,
+  httpAdapterRef: T,
+  host: string | RegExp | Array<string | RegExp>,
+  routePathMetadata: RoutePathMetadata,
+  options: RouteResolutionOptions = {},
+) {
+  const { instance } = instanceWrapper;
+  const routerPaths = this.pathsExplorer.scanForPaths(instance);
+  this.applyPathsToRouterProxy(
+    httpAdapterRef, routerPaths, instanceWrapper, moduleKey,
+    routePathMetadata, host, options,
+  );
+}
+```
+
+## Path composition with RoutePathFactory
+
+`RoutePathFactory.create` in `packages/core/router/route-path-factory.ts` assembles the final URL from:
+
+1. URI versioning segment (if `VersioningType.URI` is enabled).
+2. Module path (if the module declares one).
+3. Controller path.
+4. Method path.
+5. Global prefix (prepended last, with exclusion support).
+
+```ts packages/core/router/route-path-factory.ts
+public create(metadata: RoutePathMetadata, requestMethod?: RequestMethod): string[] {
+  let paths = [''];
+
+  const versionOrVersions = this.getVersion(metadata);
+  if (versionOrVersions && metadata.versioningOptions?.type === VersioningType.URI) {
+    const versionPrefix = this.getVersionPrefix(metadata.versioningOptions);
+    // ... append version segments ...
+  }
+
+  paths = this.appendToAllIfDefined(paths, metadata.modulePath);
+  paths = this.appendToAllIfDefined(paths, metadata.ctrlPath);
+  paths = this.appendToAllIfDefined(paths, metadata.methodPath);
+
+  if (metadata.globalPrefix) {
+    paths = paths.map(path => {
+      if (this.isExcludedFromGlobalPrefix(path, requestMethod, versionOrVersions, metadata.versioningOptions)) {
+        return path;
+      }
+      return stripEndSlash(metadata.globalPrefix || '') + path;
+    });
+  }
+
+  return paths.map(path => addLeadingSlash(path || '/'))
+              .map(path => (path !== '/' ? stripEndSlash(path) : path));
+}
+```
+
+## Route conflicts and specificity sorting
+
+When `NestApplicationOptions.routeConflictPolicy` is set, `RouteConflictDetector` in `packages/core/router/route-conflict-detector.ts` scans resolved routes for duplicates and shadows before registration. The policy can be `throw` or `warn` per conflict kind (`duplicate` and `shadow`).
+
+When `routeResolutionStrategy === 'specificity'` and the adapter is order-sensitive, `RouteSpecificitySorter.sort` in `packages/core/router/route-specificity-sorter.ts` orders routes so literal segments come before params, and params come before wildcards.
+
+The branching logic lives in `NestApplication.registerRouter` at `packages/core/nest-application.ts`:
+
+```ts packages/core/nest-application.ts
+const adapterIsOrderSensitive =
+  this.httpAdapter.isRouteOrderSensitive?.() ?? true;
+const shouldSortBySpecificity =
+  resolutionStrategy === 'specificity' && adapterIsOrderSensitive;
+const adapterRejectsDuplicates = !adapterIsOrderSensitive;
+```
+
+Fastify (`isRouteOrderSensitive() === false`) rejects duplicate `(method, url)` registrations synchronously from its own router. In that case, Nest defers registration, detects conflicts, and skips shadowed duplicates so the detector (not the adapter) decides which route wins.
+
+## Request-scoped controllers
+
+When a controller is `Scope.REQUEST` or has a non-static dependency tree, `RouterExplorer.createRequestScopedHandler` builds a per-request instance via `Injector.loadPerContext`. The handler creates a `ContextId` from the request, loads the controller instance for that context, and then invokes the composed proxy.
+
+```ts packages/core/router/router-explorer.ts
+public createRequestScopedHandler(
+  instanceWrapper: InstanceWrapper,
+  requestMethod: RequestMethod,
+  moduleRef: Module,
+  moduleKey: string,
+  methodName: string,
+) {
+  const isTreeDurable = instanceWrapper.isDependencyTreeDurable();
+
+  return async <TRequest, TResponse>(req: TRequest, res: TResponse, next: () => void) => {
+    const contextId = this.getContextId(req, isTreeDurable);
+    const contextInstance = await this.injector.loadPerContext(
+      instance, moduleRef, collection, contextId,
+    );
+    await this.createCallbackProxy(
+      contextInstance, contextInstance[methodName],
+      methodName, moduleKey, requestMethod, contextId, instanceWrapper.id,
+    )(req, res, next);
+  };
+}
+```
+
+## Source references
+
+- `packages/core/router/routes-resolver.ts` — `RoutesResolver.resolve`, `registerRouters`
+- `packages/core/router/router-explorer.ts` — `RouterExplorer.explore`, `extractRouterPath`, `applyPathsToRouterProxy`, `createRequestScopedHandler`
+- `packages/core/router/route-path-factory.ts` — `RoutePathFactory.create`, `getVersion`, `getVersionPrefix`
+- `packages/core/router/route-conflict-detector.ts` — `RouteConflictDetector.detect`, `handle`
+- `packages/core/router/route-specificity-sorter.ts` — `RouteSpecificitySorter.sort`
+- `packages/core/nest-application.ts` — `NestApplication.registerRouter`
+- `packages/common/decorators/core/controller.decorator.ts` — `@Controller`
+- `packages/common/decorators/http/request-mapping.decorator.ts` — `Get`, `Post`, `Put`, `Delete`, `Patch`, `Options`, `Head`, `All`, `Search`, `Propfind`, `Proppatch`, `Mkcol`, `Copy`, `Move`, `Lock`, `Unlock`
+- `packages/common/enums/request-method.enum.ts` — `RequestMethod`

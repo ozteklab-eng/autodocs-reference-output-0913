@@ -1,0 +1,187 @@
+---
+title: "ModuleRef and Lazy Module Loading in NestJS"
+sidebarTitle: "ModuleRef & Lazy Modules"
+description: "How ModuleRef provides runtime lookup, resolution, and introspection, and how LazyModuleLoader adds modules to the DI graph on demand at commit a3a31b9."
+---
+
+`ModuleRef` and `LazyModuleLoader` are the two runtime APIs that let you interact with the dependency-injection graph after bootstrap. `ModuleRef` supports static lookup, request-scoped resolution, arbitrary class instantiation, and scope introspection. `LazyModuleLoader` lets you load an entire module graph on demand without restarting the application. This page covers both classes and their relationship to the container and injector.
+
+## `ModuleRef` overview
+
+`ModuleRef` in `packages/core/injector/module-ref.ts` is an abstract class that each `Module` implements as a private subclass. The per-module subclass is created in `Module.createModuleReferenceType` and injected into the module's provider map under the `ModuleRef` token.
+
+The abstract class defines four key runtime methods: `get`, `resolve`, `create`, and `introspect`. It also exposes `registerRequestByContextId` for binding the `REQUEST` provider to a specific context.
+
+### `get`: static lookup
+
+`get` performs a synchronous lookup. The concrete implementation in the per-module subclass defaults `strict` to `true`, meaning it searches only the host module unless you pass `strict: false`:
+
+```ts packages/core/injector/module.ts
+public get<TInput = any, TResult = TInput>(
+  typeOrToken: Type<TInput> | string | symbol,
+  options: ModuleRefGetOrResolveOpts = {},
+): TResult | Array<TResult> {
+  options.strict ??= true;
+  options.each ??= false;
+
+  return this.find<TInput, TResult>(
+    typeOrToken,
+    options.strict
+      ? {
+          moduleId: self.id,
+          each: options.each,
+        }
+      : options,
+  );
+}
+```
+
+When `each: true` is set, `find` returns all instances registered under the same token across the application. This is useful when multiple modules provide the same interface.
+
+### `resolve`: request-scoped and transient instances
+
+`resolve` is the asynchronous counterpart for `TRANSIENT` and `REQUEST`-scoped providers. It accepts an optional `contextId` and delegates to `resolvePerContext`:
+
+```ts packages/core/injector/module.ts
+public resolve<TInput = any, TResult = TInput>(
+  typeOrToken: Type<TInput> | string | symbol,
+  contextId = createContextId(),
+  options: ModuleRefGetOrResolveOpts = {},
+): Promise<TResult | Array<TResult>> {
+  options.strict ??= true;
+  options.each ??= false;
+
+  return this.resolvePerContext<TInput, TResult>(
+    typeOrToken,
+    self,
+    contextId,
+    options,
+  );
+}
+```
+
+If you do not pass a `contextId`, `ModuleRef` creates a fresh one via `ContextIdFactory.create()`. `resolvePerContext` then uses the internal `Injector` to load the provider for that context, which triggers the full per-request instantiation path.
+
+### `create`: instantiate an arbitrary class
+
+`create` lets you instantiate any class using the current module's provider graph as the resolution context:
+
+```ts packages/core/injector/module-ref.ts
+public async create<T = any>(
+  type: Type<T>,
+  contextId?: ContextId,
+): Promise<T> {
+  if (!(type && isFunction(type) && type.prototype)) {
+    throw new InvalidClassException(type);
+  }
+  return this.instantiateClass<T>(type, self, contextId);
+}
+```
+
+`instantiateClass` builds a temporary `InstanceWrapper`, creates a prototype, resolves constructor parameters through the injector, and returns the new instance. This is useful for factory patterns or runtime object creation that still participates in DI.
+
+### `introspect`: reveal scope information
+
+`introspect` returns an `IntrospectionResult` describing the provider's scope:
+
+```ts packages/core/injector/module-ref.ts
+public introspect<T = any>(
+  token: Type<T> | string | symbol,
+): IntrospectionResult {
+  const { wrapperRef } = this.instanceLinksHost.get(token);
+
+  let scope = Scope.DEFAULT;
+  if (!wrapperRef.isDependencyTreeStatic()) {
+    scope = Scope.REQUEST;
+  } else if (wrapperRef.isTransient) {
+    scope = Scope.TRANSIENT;
+  }
+  return { scope };
+}
+```
+
+Note that `introspect` reports `Scope.REQUEST` for any provider whose dependency tree is non-static, even if the provider itself was not explicitly marked `REQUEST`.
+
+### `registerRequestByContextId`
+
+This helper binds the raw request object to the `REQUEST` provider under a given `ContextId`:
+
+```ts packages/core/injector/module-ref.ts
+public registerRequestByContextId<T = any>(request: T, contextId: ContextId) {
+  this.container.registerRequestProvider(request, contextId);
+}
+```
+
+It delegates to `NestContainer.registerRequestProvider`, which stores the request in the `InternalCoreModule`'s `REQUEST` wrapper via `setInstanceByContextId`. This is the mechanism that makes `@Inject(REQUEST)` resolve to the current HTTP request inside a request-scoped tree.
+
+## `LazyModuleLoader`
+
+`LazyModuleLoader` in `packages/core/injector/lazy-module-loader/lazy-module-loader.ts` loads a module graph on demand after the application has already started. It is exposed as the `LazyModuleLoader` provider that you can inject into services.
+
+### `load` method
+
+```ts packages/core/injector/lazy-module-loader/lazy-module-loader.ts
+public async load(
+  loaderFn: () =>
+    Promise<Type<unknown> | DynamicModule> | Type<unknown> | DynamicModule,
+  loadOpts?: LazyModuleLoaderLoadOptions,
+): Promise<ModuleRef> {
+  const originalLogger = (this.instanceLoader as any).logger;
+  try {
+    this.registerLoggerConfiguration(loadOpts);
+
+    const moduleClassOrDynamicDefinition = await loaderFn();
+    const moduleInstances = await this.dependenciesScanner.scanForModules({
+      moduleDefinition: moduleClassOrDynamicDefinition,
+      overrides: this.moduleOverrides,
+      lazy: true,
+    });
+    if (moduleInstances.length === 0) {
+      const { token } = await this.moduleCompiler.compile(
+        moduleClassOrDynamicDefinition,
+      );
+      const moduleInstance = this.modulesContainer.get(token)!;
+      return moduleInstance && this.getTargetModuleRef(moduleInstance);
+    }
+    const lazyModulesContainer =
+      this.createLazyModulesContainer(moduleInstances);
+    await this.dependenciesScanner.scanModulesForDependencies(
+      lazyModulesContainer,
+    );
+    await this.instanceLoader.createInstancesOfDependencies(
+      lazyModulesContainer,
+    );
+    const [targetModule] = moduleInstances;
+    return this.getTargetModuleRef(targetModule);
+  } finally {
+    if (loadOpts?.logger === false) {
+      this.instanceLoader.setLogger(originalLogger);
+    }
+  }
+}
+```
+
+The method performs the following steps:
+
+1. Awaits the loader function to obtain the module class or `DynamicModule`.
+2. Calls `DependenciesScanner.scanForModules` with `lazy: true`. If the module is already registered, it returns an empty array.
+3. If the module is new, `scanModulesForDependencies` reflects imports, providers, controllers, and exports for the lazy subgraph.
+4. `InstanceLoader.createInstancesOfDependencies` runs the standard two-phase creation (prototypes then instances) for the lazy subgraph.
+5. Returns the `ModuleRef` of the target module.
+
+### What lazy modules skip
+
+Lazy modules are designed for on-demand background dependency graphs. By design, they do not register controllers or middleware with the HTTP adapter. The scanner and instance loader operate on a local `lazyModulesContainer` that is not merged back into the main module set for routing purposes. This means you can use `LazyModuleLoader` to pull in services, providers, and libraries at runtime without affecting the existing request pipeline.
+
+### Logger suppression
+
+`LazyModuleLoader` accepts an optional `logger: false` option. When set, it temporarily swaps the `InstanceLoader` logger for a `SilentLogger` to avoid noise during background module loading.
+
+## Relationship to the container
+
+Both `ModuleRef` and `LazyModuleLoader` depend on the same `NestContainer` and `Injector` infrastructure:
+
+- `ModuleRef` uses `InstanceLinksHost` to resolve tokens to `InstanceWrapper` references across the whole graph.
+- `LazyModuleLoader` uses `DependenciesScanner`, `ModuleCompiler`, and `InstanceLoader`, the same classes used during initial bootstrap.
+
+This consistency means that lazy-loaded providers participate in the same DI semantics (scopes, circular-dependency detection, custom providers) as eagerly loaded ones.
